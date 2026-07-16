@@ -1925,6 +1925,123 @@ def test_externalized_payload_integrity_scan_reports_missing_and_unreferenced_re
     assert "not-counted.json" not in encoded
 
 
+def test_externalized_payload_integrity_scan_ignores_template_refs_and_fixture_files(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    for ref in (
+        "20260716_120000_tool-call_present_payload_0123456789ab_abcdef.json",
+        "20260716_120000_tool-call_orphan_payload_0123456789ab_abcdef.json",
+        "20260708T120000Z-tool-call-{index}.json",
+    ):
+        (storage_dir / ref).write_text(json.dumps({"content": "fixture payload"}))
+
+    present_ref = "20260716_120000_tool-call_present_payload_0123456789ab_abcdef.json"
+    missing_ref = "20260716_120000_tool-call_missing_payload_0123456789ab_abcdef.json"
+    template_ref = "20260708T120000Z-tool-call-{index}.json"
+    content = "\n".join(
+        [
+            f"[Externalized payload: kind=raw_payload; role=assistant; chars=1; ref={present_ref}]",
+            f"[Externalized payload: kind=raw_payload; role=assistant; chars=1; ref={missing_ref}]",
+            (
+                'fixture_source = "[Externalized tool output: tool_call_id=call-{index}; '
+                f'chars=1; ref={template_ref}]"'
+            ),
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "test",
+            "assistant",
+            content,
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 2
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"] == [
+        {
+            "store_id": 1,
+            "session_id": engine.current_session_id,
+            "source": "test",
+            "role": "assistant",
+            "field": "content",
+            "externalized_ref": missing_ref,
+        }
+    ]
+    assert detail["externalized_payload_files_unreferenced"] == 1
+    assert detail["unreferenced_externalized_payload_files"] == [
+        {"externalized_ref": "20260716_120000_tool-call_orphan_payload_0123456789ab_abcdef.json"}
+    ]
+
+
+def test_externalized_payload_integrity_scan_preserves_real_braced_refs(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    present_ref = "20260716_120000_call-{index}_0123456789ab_abcdef.json"
+    missing_ref = "20260716_120000_call-{missing}_0123456789ab_abcdef.json"
+    orphan_ref = "20260716_120000_call-{orphan}_0123456789ab_abcdef.json"
+    for ref in (present_ref, orphan_ref):
+        (storage_dir / ref).write_text(json.dumps({"content": "real payload"}))
+
+    content = "\n".join(
+        [
+            f"[Externalized tool output: tool_call_id=call--index-; chars=1; ref={present_ref}]",
+            f"[Externalized tool output: tool_call_id=call--missing-; chars=1; ref={missing_ref}]",
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "test",
+            "tool",
+            content,
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 2
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"][0]["externalized_ref"] == missing_ref
+    assert detail["externalized_payload_files_unreferenced"] == 1
+    assert detail["unreferenced_externalized_payload_files"] == [{"externalized_ref": orphan_ref}]
+
+
 def test_externalized_payload_integrity_scan_detects_embedded_content_placeholder_with_trailing_text(tmp_path):
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()

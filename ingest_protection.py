@@ -117,6 +117,13 @@ _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*r
 _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
 )
+_TEMPLATE_PAYLOAD_REF_RE = re.compile(
+    r"\{[A-Za-z_][A-Za-z0-9_]*(?:![rsa])?(?::[^{}\r\n]*)?\}"
+)
+_SOURCE_LITERAL_ASSIGNMENT_RE = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:[rubf]{0,2})?(?:\\+)?[\"']\s*$",
+    re.IGNORECASE,
+)
 _PERSISTED_OUTPUT_TAG = "<persisted-output>"
 _PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 _PERSISTED_OUTPUT_SAVED_TO_RE = re.compile(r"^Full output saved to:\s*(?P<path>.+?)\s*$", re.MULTILINE)
@@ -651,6 +658,11 @@ def extract_ingest_externalized_refs(text: str) -> list[str]:
 
 def _is_basename_ref(ref: str) -> bool:
     return bool(ref) and ref.endswith(".json") and "/" not in ref and "\\" not in ref and Path(ref).name == ref
+
+
+def _is_template_payload_ref(ref: str) -> bool:
+    """Return true when a filename still contains a format-field placeholder."""
+    return bool(_TEMPLATE_PAYLOAD_REF_RE.search(ref))
 
 
 def extract_all_externalized_payload_refs(text: str) -> list[str]:
@@ -1675,12 +1687,34 @@ def _looks_like_example_payload_ref(ref: str) -> bool:
     return name.startswith(("example-", "example_", "fake-", "fake_", "dummy-", "dummy_", "placeholder-", "placeholder_"))
 
 
+def _is_template_source_literal_ref(text: str, start: int, ref: str) -> bool:
+    """Return true for an unrendered ref inside a quoted source assignment."""
+    if not _is_template_payload_ref(ref):
+        return False
+    context = text[max(0, start - 160):start]
+    return _SOURCE_LITERAL_ASSIGNMENT_RE.search(context) is not None
+
+
+def _extract_template_source_literal_refs(text: str) -> list[str]:
+    refs: list[str] = []
+    for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
+        for match in pattern.finditer(text):
+            ref = match.group(1).strip()
+            if (
+                _is_basename_ref(ref)
+                and _is_template_source_literal_ref(text, match.start(), ref)
+                and ref not in refs
+            ):
+                refs.append(ref)
+    return refs
+
+
 def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spans: bool = False) -> list[str]:
     refs: list[str] = []
     for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
         for match in pattern.finditer(text):
             ref = match.group(1).strip()
-            if not _is_basename_ref(ref):
+            if not _is_basename_ref(ref) or _is_template_source_literal_ref(text, match.start(), ref):
                 continue
             if _looks_like_example_payload_ref(ref) and _is_escaped_placeholder_example(text, match.start()):
                 continue
@@ -1755,7 +1789,7 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
                 else:
                     _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
         return refs
-    return extract_all_externalized_payload_refs(value)
+    return _extract_unescaped_externalized_payload_refs(value)
 
 
 def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", limit: int = 5) -> dict[str, Any]:
@@ -1772,6 +1806,7 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
         existing_files = {path.name for path in storage_dir.glob("*.json") if path.is_file()}
 
     referenced_refs: set[str] = set()
+    incidental_template_refs: set[str] = set()
     first_location_by_ref: dict[str, dict[str, Any]] = {}
     for store_id, session_id, source, role, content, tool_calls in conn.execute(
         """
@@ -1785,6 +1820,7 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
         for field, value in (("content", content), ("tool_calls", tool_calls)):
             if not isinstance(value, str):
                 continue
+            incidental_template_refs.update(_extract_template_source_literal_refs(value))
             for ref in _refs_for_externalized_integrity_scan(value, role=str(role or ""), field=field):
                 referenced_refs.add(ref)
                 first_location_by_ref.setdefault(
@@ -1801,7 +1837,9 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
 
     missing_refs = sorted(ref for ref in referenced_refs if ref not in existing_files)
     existing_ref_count = sum(1 for ref in referenced_refs if ref in existing_files)
-    unreferenced_files = sorted(ref for ref in existing_files if ref not in referenced_refs)
+    unreferenced_files = sorted(
+        ref for ref in existing_files if ref not in referenced_refs and ref not in incidental_template_refs
+    )
 
     return {
         "externalized_payload_refs_total": len(referenced_refs),
