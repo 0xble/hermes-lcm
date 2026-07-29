@@ -154,9 +154,13 @@ def test_answer_ready_backfills_past_malformed_and_missing_references(
     recall_engine, monkeypatch
 ):
     recall_engine._config.embeddings_enabled = False
-    valid_id = recall_engine._store.append(
-        "session-valid",
-        {"role": "user", "content": "exact citable evidence from durable storage"},
+    stale_span_id = recall_engine._store.append(
+        "session-stale",
+        {"role": "user", "content": "stale span must not cite this offset-zero text"},
+    )
+    fallback_id = recall_engine._store.append(
+        "session-fallback",
+        {"role": "user", "content": "exact citable fallback from durable storage"},
     )
     malformed_hits = [
         {
@@ -175,11 +179,18 @@ def test_answer_ready_backfills_past_malformed_and_missing_references(
         },
         {
             "kind": "message_excerpt",
-            "store_id": valid_id,
+            "store_id": stale_span_id,
             "session_id": "forged-session-id",
             "snippet": "untrusted preview",
             "timestamp": 1.0,
             "chunk_span": {"char_start": "broken", "char_end": -1},
+        },
+        {
+            "kind": "message_excerpt",
+            "store_id": fallback_id,
+            "session_id": "forged-session-id",
+            "snippet": "untrusted preview",
+            "timestamp": 0.5,
         },
     ]
     monkeypatch.setattr(
@@ -201,31 +212,34 @@ def test_answer_ready_backfills_past_malformed_and_missing_references(
     assert payload["hits"] == [
         {
             "kind": "message_excerpt",
-            "store_id": valid_id,
-            "session_id": "session-valid",
+            "store_id": fallback_id,
+            "session_id": "session-fallback",
             "timestamp": payload["hits"][0]["timestamp"],
-            "snippet": "exact citable evidence from durable storage",
+            "snippet": "exact citable fallback from durable storage",
             "score": payload["hits"][0]["score"],
-            "expand_hint": f"lcm_expand(store_id={valid_id}, content_offset=0)",
+            "expand_hint": f"lcm_expand(store_id={fallback_id}, content_offset=0)",
             "from_current_session": False,
             "arms": ["fts"],
             "citation": {
                 "tool": "lcm_expand",
-                "store_id": valid_id,
+                "store_id": fallback_id,
                 "content_offset": 0,
             },
         }
     ]
     assert payload["provenance"]["reference_strict"] == {
         "enabled": True,
-        "omitted_uncitable": 2,
+        "omitted_uncitable": 3,
     }
 
 
 def test_answer_ready_hydrates_summary_to_exact_raw_source(recall_engine, monkeypatch):
     source_id = recall_engine._store.append(
         "session-source",
-        {"role": "assistant", "content": "raw source that supports the memory"},
+        {
+            "role": "assistant",
+            "content": "raw kanban dashboard sprint source that supports the memory",
+        },
     )
     node_id = recall_engine._dag.add_node(
         SummaryNode(
@@ -270,8 +284,239 @@ def test_answer_ready_hydrates_summary_to_exact_raw_source(recall_engine, monkey
 
     assert payload["hits"][0]["kind"] == "message_excerpt"
     assert payload["hits"][0]["store_id"] == source_id
-    assert payload["hits"][0]["snippet"] == "raw source that supports the memory"
+    assert payload["hits"][0]["snippet"] == (
+        "raw kanban dashboard sprint source that supports the memory"
+    )
     assert payload["hits"][0]["source_node_id"] == node_id
+
+
+def test_answer_ready_summary_selects_query_relevant_source(recall_engine, monkeypatch):
+    unrelated_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "the weather forecast is clear tomorrow"},
+    )
+    relevant_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "the cobalt orchid launch code is seven"},
+    )
+    node_id = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary="The cobalt orchid launch code is seven.",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[unrelated_id, relevant_id],
+            source_type="messages",
+            created_at=1.0,
+        )
+    )
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_summary_arm",
+        lambda *_a, **_k: (
+            [{
+                "kind": "summary",
+                "node_id": node_id,
+                "session_id": "session-summary",
+                "snippet": "The cobalt orchid launch code is seven.",
+                "timestamp": 1.0,
+                "from_current_session": False,
+            }],
+            "full",
+            1,
+            1,
+        ),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt orchid launch code",
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == relevant_id
+    assert payload["hits"][0]["snippet"] == "the cobalt orchid launch code is seven"
+    assert payload["hits"][0]["source_node_id"] == node_id
+
+
+def test_answer_ready_summary_selects_source_relevant_to_matched_fact(
+    recall_engine, monkeypatch
+):
+    unrelated_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "weather forecast clear tomorrow"},
+    )
+    relevant_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "the launch vehicle uses a methane engine"},
+    )
+    node_id = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary="The launch vehicle uses a methane engine.",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[unrelated_id, relevant_id],
+            source_type="messages",
+            created_at=1.0,
+        )
+    )
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_summary_arm",
+        lambda *_a, **_k: (
+            [{
+                "kind": "summary",
+                "node_id": node_id,
+                "session_id": "session-summary",
+                "snippet": "The launch vehicle uses a methane engine.",
+                "timestamp": 1.0,
+                "from_current_session": False,
+            }],
+            "full",
+            1,
+            1,
+        ),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="rocket propulsion",
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == relevant_id
+
+
+def test_answer_ready_summary_without_relevant_source_backfills(
+    recall_engine, monkeypatch
+):
+    unrelated_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "the weather forecast is clear tomorrow"},
+    )
+    relevant_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "cobalt orchid evidence from the later summary"},
+    )
+    unrelated_node = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary="Cobalt orchid launch code.",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[unrelated_id],
+            source_type="messages",
+            created_at=2.0,
+        )
+    )
+    relevant_node = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary="Cobalt orchid evidence.",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[relevant_id],
+            source_type="messages",
+            created_at=1.0,
+        )
+    )
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_summary_arm",
+        lambda *_a, **_k: (
+            [
+                {
+                    "kind": "summary",
+                    "node_id": unrelated_node,
+                    "session_id": "session-summary",
+                    "snippet": "Cobalt orchid launch code.",
+                    "timestamp": 2.0,
+                    "from_current_session": False,
+                },
+                {
+                    "kind": "summary",
+                    "node_id": relevant_node,
+                    "session_id": "session-summary",
+                    "snippet": "Cobalt orchid evidence.",
+                    "timestamp": 1.0,
+                    "from_current_session": False,
+                },
+            ],
+            "full",
+            2,
+            2,
+        ),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt orchid",
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == relevant_id
+    assert payload["provenance"]["reference_strict"]["omitted_uncitable"] == 1
+
+
+@pytest.mark.parametrize(
+    "span",
+    [
+        None,
+        [],
+        {"char_start": "0", "char_end": 8},
+        {"char_start": True, "char_end": 8},
+        {"char_start": 8, "char_end": 8},
+        {"char_start": 0, "char_end": 999},
+    ],
+)
+def test_answer_ready_rejects_malformed_or_stale_chunk_span(
+    recall_engine, monkeypatch, span
+):
+    recall_engine._config.embeddings_enabled = False
+    store_id = recall_engine._store.append(
+        "session-source",
+        {"role": "user", "content": "unrelated offset-zero text then actual evidence"},
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_a, **_k: ([{
+            "kind": "message_excerpt",
+            "store_id": store_id,
+            "session_id": "session-source",
+            "snippet": "forged preview",
+            "timestamp": 1.0,
+            "chunk_span": span,
+        }], None),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"] == []
+    assert payload["provenance"]["reference_strict"]["omitted_uncitable"] == 1
 
 
 def test_retrieval_flags_restore_bounded_and_snippet_behavior(
@@ -688,6 +933,114 @@ def test_recall_uses_recall_timeout_budget(recall_engine, monkeypatch):
     payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=5)
     assert payload.get("timeout") is not True
     assert payload["hits"]
+
+
+@pytest.mark.parametrize("slow_stage", ["dag", "message"])
+def test_answer_ready_hydration_stops_at_deadline_and_reports_timeout(
+    recall_engine, monkeypatch, slow_stage
+):
+    source_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "cobalt orchid deadline evidence"},
+    )
+    node_id = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary="Cobalt orchid deadline evidence.",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[source_id],
+            source_type="messages",
+            created_at=1.0,
+        )
+    )
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_summary_arm",
+        lambda *_a, **_k: (
+            [
+                {
+                    "kind": "summary",
+                    "node_id": node_id,
+                    "session_id": "session-summary",
+                    "snippet": "Cobalt orchid deadline evidence.",
+                    "timestamp": 1.0,
+                    "from_current_session": False,
+                }
+            ],
+            "full",
+            1,
+            1,
+        ),
+    )
+    real_get_node = recall_engine._dag.get_node
+    real_get_batch = recall_engine._store.get_batch
+    calls = {"dag": 0, "message": 0}
+
+    def slow_get_node(requested_node_id):
+        calls["dag"] += 1
+        if slow_stage == "dag":
+            time.sleep(0.55)
+        return real_get_node(requested_node_id)
+
+    def slow_get_batch(store_ids):
+        calls["message"] += 1
+        if slow_stage == "message":
+            time.sleep(0.55)
+        return real_get_batch(store_ids)
+
+    monkeypatch.setattr(recall_engine._dag, "get_node", slow_get_node)
+    monkeypatch.setattr(recall_engine._store, "get_batch", slow_get_batch)
+    recall_engine._config.recall_query_timeout_s = 0.5
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt orchid",
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert calls[slow_stage] == 1
+    if slow_stage == "dag":
+        assert calls["message"] == 0
+    assert payload["hits"] == []
+    assert payload["timeout"] is True
+    assert payload["degraded"] is True
+    assert "citation hydration timed out" in payload["degraded_reason"]
+
+
+@pytest.mark.parametrize("failure_path", ["search", "like_fallback"])
+def test_recall_reports_full_text_failures_instead_of_full_empty_coverage(
+    recall_engine, monkeypatch, failure_path
+):
+    recall_engine._config.embeddings_enabled = False
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(f"simulated {failure_path} database failure")
+
+    if failure_path == "search":
+        monkeypatch.setattr(recall_engine._store, "search", fail)
+        query = "cobalt orchid"
+    else:
+        monkeypatch.setattr(type(recall_engine._store), "_search_like", fail)
+        query = "cobalt/orchid"
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query=query,
+        include="verbatim",
+        limit=1,
+    )
+
+    assert payload["hits"] == []
+    assert payload["provenance"]["coverage"]["fts"] == "none"
+    assert payload["degraded"] is True
+    assert "full-text arm unavailable" in payload["degraded_reason"]
 
 
 def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch):

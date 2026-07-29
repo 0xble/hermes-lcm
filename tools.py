@@ -67,7 +67,13 @@ from .retrieval_core import (
     run_knn,
 )
 from .rollup_store import RollupStore
-from .search_query import AGE_DECAY_RATE, normalize_search_sort
+from .search_query import (
+    AGE_DECAY_RATE,
+    compute_directness_score,
+    extract_quoted_phrases,
+    extract_search_terms,
+    normalize_search_sort,
+)
 from .session_patterns import build_session_match_keys, compile_session_pattern
 from .sqlite_util import _sqlite_savepoint
 from .store import build_message_fts_spec
@@ -1820,6 +1826,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     current_session_id = engine.current_session_id
     has_current_session = bool(current_session_id)
     results: list[Dict[str, Any]] = []
+    search_failures: list[str] = []
 
     if content_scope in {"history", "both"}:
         try:
@@ -1844,6 +1851,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 )
         except Exception as exc:
             logger.warning("Message search failed: %s", exc)
+            search_failures.append(f"message search failed: {exc}")
 
     # Summary-node search is intentionally current-session only. Cross-session
     # DAG expansion is deferred; returning summary hits without an expansion
@@ -1863,6 +1871,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 results.append(_shape_summary_hit(node))
         except Exception as exc:
             logger.warning("Node search failed: %s", exc)
+            search_failures.append(f"summary search failed: {exc}")
 
     externalized_scan: dict[str, Any] | None = None
     externalized_results_omitted = False
@@ -2102,6 +2111,10 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
         response["externalized_refs"] = externalized_refs
     if externalized_scan is not None:
         response["externalized_scan"] = externalized_scan
+    if search_failures:
+        response["degraded"] = True
+        response["degraded_reason"] = "; ".join(search_failures)
+        response["search_failures"] = search_failures
     return json.dumps(response)
 
 
@@ -2842,8 +2855,18 @@ def _lcm_recall_positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _lcm_recall_require_deadline(deadline: float, stage: str) -> None:
+    if time.monotonic() >= deadline:
+        raise TimeoutError(f"citation hydration deadline exhausted during {stage}")
+
+
 def _lcm_recall_summary_source_ids(
-    engine: "LCMEngine", node_id: Any, *, max_nodes: int = 64, max_sources: int = 64
+    engine: "LCMEngine",
+    node_id: Any,
+    *,
+    deadline: float,
+    max_nodes: int = 64,
+    max_sources: int = 64,
 ) -> list[int]:
     """Resolve one summary to bounded raw-source ids without trusting its refs."""
     root = _lcm_recall_positive_int(node_id)
@@ -2853,14 +2876,19 @@ def _lcm_recall_summary_source_ids(
     seen_nodes: set[int] = set()
     source_ids: list[int] = []
     while queue and len(seen_nodes) < max_nodes and len(source_ids) < max_sources:
+        _lcm_recall_require_deadline(deadline, "summary lineage lookup")
         current = queue.pop(0)
         if current in seen_nodes:
             continue
         seen_nodes.add(current)
         try:
             node = engine._dag.get_node(current)
+        except TimeoutError:
+            raise
         except Exception:  # malformed/corrupt lineage is uncitable, not fatal
+            _lcm_recall_require_deadline(deadline, "summary lineage lookup")
             continue
+        _lcm_recall_require_deadline(deadline, "summary lineage lookup")
         if node is None or not isinstance(node.source_ids, list):
             continue
         if node.source_type == "messages":
@@ -2878,31 +2906,89 @@ def _lcm_recall_summary_source_ids(
     return source_ids
 
 
+def _lcm_recall_relevant_summary_row(
+    rows: dict[int, dict[str, Any]],
+    candidate_ids: list[int],
+    *,
+    query: str,
+    matched_summary: str,
+    deadline: float,
+) -> dict[str, Any] | None:
+    """Choose query-relevant raw evidence; fail closed when none supports it."""
+    query_terms = extract_search_terms(query)
+    query_phrases = extract_quoted_phrases(query)
+    summary_terms = extract_search_terms(matched_summary)
+    summary_phrases = extract_quoted_phrases(matched_summary)
+    best: tuple[tuple[float, float, float, int], dict[str, Any]] | None = None
+    for index, source_id in enumerate(candidate_ids):
+        _lcm_recall_require_deadline(deadline, "summary evidence scoring")
+        row = rows.get(source_id)
+        if row is None:
+            continue
+        content = str(row.get("content") or "")
+        if not content:
+            continue
+        query_score = compute_directness_score(content, query_terms, query_phrases)
+        summary_score = compute_directness_score(
+            content, summary_terms, summary_phrases
+        )
+        if query_score > 0:
+            rank = (2.0, query_score, summary_score, -index)
+        elif summary_score > 0:
+            rank = (1.0, summary_score, 0.0, -index)
+        else:
+            continue
+        if best is None or rank > best[0]:
+            best = (rank, row)
+    _lcm_recall_require_deadline(deadline, "summary evidence scoring")
+    return best[1] if best is not None else None
+
+
 def _lcm_recall_citable_hit(
-    engine: "LCMEngine", hit: dict[str, Any]
+    engine: "LCMEngine",
+    hit: dict[str, Any],
+    *,
+    query: str,
+    deadline: float,
 ) -> dict[str, Any] | None:
     """Hydrate an untrusted candidate to one exact, expandable raw message."""
+    _lcm_recall_require_deadline(deadline, "candidate hydration")
     source_node_id: int | None = None
     if hit.get("kind") == "summary":
         source_node_id = _lcm_recall_positive_int(hit.get("node_id"))
-        candidate_ids = _lcm_recall_summary_source_ids(engine, source_node_id)
+        candidate_ids = _lcm_recall_summary_source_ids(
+            engine, source_node_id, deadline=deadline
+        )
     else:
         store_id = _lcm_recall_positive_int(hit.get("store_id"))
         candidate_ids = [store_id] if store_id is not None else []
     if not candidate_ids:
         return None
+    _lcm_recall_require_deadline(deadline, "message batch lookup")
     try:
         rows = engine._store.get_batch(candidate_ids)
+    except TimeoutError:
+        raise
     except Exception:
         return None
-    row = next(
-        (
-            rows[source_id]
-            for source_id in candidate_ids
-            if source_id in rows and str(rows[source_id].get("content") or "")
-        ),
-        None,
-    )
+    _lcm_recall_require_deadline(deadline, "message batch lookup")
+    if source_node_id is not None:
+        row = _lcm_recall_relevant_summary_row(
+            rows,
+            candidate_ids,
+            query=query,
+            matched_summary=str(hit.get("snippet") or ""),
+            deadline=deadline,
+        )
+    else:
+        row = next(
+            (
+                rows[source_id]
+                for source_id in candidate_ids
+                if source_id in rows and str(rows[source_id].get("content") or "")
+            ),
+            None,
+        )
     if row is None:
         return None
     store_id = _lcm_recall_positive_int(row.get("store_id"))
@@ -2911,15 +2997,25 @@ def _lcm_recall_citable_hit(
     content = str(row.get("content") or "")
     content_offset = 0
     excerpt = content[:_LCM_RECALL_SNIPPET_CHARS]
-    span = hit.get("chunk_span")
-    if isinstance(span, dict):
-        start = _lcm_recall_positive_int(span.get("char_start"))
-        if span.get("char_start") == 0 and not isinstance(span.get("char_start"), bool):
-            start = 0
-        end = _lcm_recall_positive_int(span.get("char_end"))
-        if start is not None and end is not None and 0 <= start < end <= len(content):
-            content_offset = start
-            excerpt = content[start:end][:_LCM_RECALL_SNIPPET_CHARS]
+    if "chunk_span" in hit:
+        span = hit.get("chunk_span")
+        if not isinstance(span, dict):
+            return None
+        start = span.get("char_start")
+        end = span.get("char_end")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or not 0 <= start < end <= len(content)
+        ):
+            return None
+        content_offset = start
+        excerpt = content[start:end][:_LCM_RECALL_SNIPPET_CHARS]
+        if not excerpt:
+            return None
+    _lcm_recall_require_deadline(deadline, "candidate hydration")
     citable = {
         "kind": "message_excerpt",
         "store_id": store_id,
@@ -2995,6 +3091,11 @@ def _lcm_recall_fts_arm(
     )
     if "error" in payload:
         return [], payload
+    if payload.get("degraded"):
+        return [], {
+            "error": payload.get("degraded_reason") or "full-text search degraded",
+            "timeout": bool(payload.get("timeout")),
+        }
     hits: list[dict[str, Any]] = []
     for row in payload.get("results", []):
         store_id = row.get("store_id")
@@ -3492,7 +3593,14 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     for entry in ordered:
         hit = entry["hit"]
         if detail == "answer_ready":
-            citable = _lcm_recall_citable_hit(engine, hit)
+            try:
+                citable = _lcm_recall_citable_hit(
+                    engine, hit, query=query, deadline=deadline
+                )
+            except TimeoutError:
+                timed_out = True
+                degraded_reasons.append("citation hydration timed out")
+                break
             if citable is None:
                 omitted_uncitable += 1
                 continue
