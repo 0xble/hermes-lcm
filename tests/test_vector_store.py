@@ -391,6 +391,73 @@ def test_bounded_scan_uses_source_recency_after_newest_first_backfill(
         dag.close()
 
 
+def test_full_scan_reaches_best_vector_outside_recency_bound(tmp_path):
+    db_path = tmp_path / "full-scan.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        oldest = _add_summary(dag, created_at=1.0)
+        newest = _add_summary(dag, created_at=2.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, oldest, "summary", "full-scan", [1.0, 0.0])
+        _record_embedding(store, newest, "summary", "full-scan", [0.0, 1.0])
+
+        bounded = store.knn([1.0, 0.0], k=1, model="full-scan")
+        exhaustive = store.knn(
+            [1.0, 0.0],
+            k=1,
+            model="full-scan",
+            full_scan=True,
+        )
+
+        assert bounded.coverage == "bounded"
+        assert [row[0] for row in bounded] == [str(newest)]
+        assert exhaustive.coverage == "full"
+        assert exhaustive.scanned == exhaustive.total == 2
+        assert [row[0] for row in exhaustive] == [str(oldest)]
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_full_scan_timeout_releases_read_snapshot(tmp_path, monkeypatch):
+    db_path = tmp_path / "full-scan-timeout.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        node_id = _add_summary(dag, created_at=1.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, node_id, "summary", "full-scan", [1.0, 0.0])
+        ticks = iter([0.0, 1.0])
+        monkeypatch.setattr(
+            vector_store_module.time, "monotonic", lambda: next(ticks, 1.0)
+        )
+
+        with pytest.raises(TimeoutError, match="deadline exhausted"):
+            store.knn(
+                [1.0, 0.0],
+                k=1,
+                model="full-scan",
+                full_scan=True,
+                deadline=0.5,
+            )
+        assert store.connection.in_transaction is False
+
+        monkeypatch.setattr(vector_store_module.time, "monotonic", lambda: 0.0)
+        recovered = store.knn(
+            [1.0, 0.0],
+            k=1,
+            model="full-scan",
+            full_scan=True,
+            deadline=1.0,
+        )
+        assert recovered.coverage == "full"
+        assert [row[0] for row in recovered] == [str(node_id)]
+    finally:
+        store.close()
+        dag.close()
+
+
 
 def test_bounded_scan_keeps_null_latest_at_legacy_rows_by_created_at(
     tmp_path, monkeypatch

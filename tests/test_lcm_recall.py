@@ -123,6 +123,198 @@ def _recall(engine, monkeypatch, provider=None, **args):
     return payload
 
 
+def test_recall_fts_finds_oldest_matching_message_beyond_candidate_window(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    oldest = recall_engine._store.append(
+        "session-old",
+        {"role": "user", "content": "cobalt-orchid immutable recovery note"},
+    )
+    for index in range(75):
+        recall_engine._store.append(
+            f"session-new-{index}",
+            {"role": "user", "content": f"ordinary recent note {index}"},
+        )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        provider=MockProvider(),
+        query="cobalt orchid",
+        include="verbatim",
+        limit=1,
+    )
+
+    assert payload["provenance"]["coverage"]["fts"] == "full"
+    assert payload["hits"][0]["store_id"] == oldest
+
+
+def test_answer_ready_backfills_past_malformed_and_missing_references(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    valid_id = recall_engine._store.append(
+        "session-valid",
+        {"role": "user", "content": "exact citable evidence from durable storage"},
+    )
+    malformed_hits = [
+        {
+            "kind": "message_excerpt",
+            "store_id": "not-an-integer",
+            "session_id": "session-bad",
+            "snippet": "must not escape",
+            "timestamp": 3.0,
+        },
+        {
+            "kind": "message_excerpt",
+            "store_id": 999_999,
+            "session_id": "session-missing",
+            "snippet": "must not cite a missing row",
+            "timestamp": 2.0,
+        },
+        {
+            "kind": "message_excerpt",
+            "store_id": valid_id,
+            "session_id": "forged-session-id",
+            "snippet": "untrusted preview",
+            "timestamp": 1.0,
+            "chunk_span": {"char_start": "broken", "char_end": -1},
+        },
+    ]
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_args, **_kwargs: (malformed_hits, None),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["detail"] == "answer_ready"
+    assert payload["total_results"] == 1
+    assert payload["hits"] == [
+        {
+            "kind": "message_excerpt",
+            "store_id": valid_id,
+            "session_id": "session-valid",
+            "timestamp": payload["hits"][0]["timestamp"],
+            "snippet": "exact citable evidence from durable storage",
+            "score": payload["hits"][0]["score"],
+            "expand_hint": f"lcm_expand(store_id={valid_id}, content_offset=0)",
+            "from_current_session": False,
+            "arms": ["fts"],
+            "citation": {
+                "tool": "lcm_expand",
+                "store_id": valid_id,
+                "content_offset": 0,
+            },
+        }
+    ]
+    assert payload["provenance"]["reference_strict"] == {
+        "enabled": True,
+        "omitted_uncitable": 2,
+    }
+
+
+def test_answer_ready_hydrates_summary_to_exact_raw_source(recall_engine, monkeypatch):
+    source_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "raw source that supports the memory"},
+    )
+    node_id = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary="summary prose must not be presented as a verbatim citation",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[source_id],
+            source_type="messages",
+            created_at=1.0,
+        )
+    )
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_summary_arm",
+        lambda *_a, **_k: (
+            [
+                {
+                    "kind": "summary",
+                    "node_id": node_id,
+                    "session_id": "session-summary",
+                    "snippet": "summary prose must not be cited directly",
+                    "timestamp": 1.0,
+                    "from_current_session": False,
+                }
+            ],
+            "full",
+            1,
+            1,
+        ),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["kind"] == "message_excerpt"
+    assert payload["hits"][0]["store_id"] == source_id
+    assert payload["hits"][0]["snippet"] == "raw source that supports the memory"
+    assert payload["hits"][0]["source_node_id"] == node_id
+
+
+def test_retrieval_flags_restore_bounded_and_snippet_behavior(
+    recall_engine, monkeypatch
+):
+    monkeypatch.setenv("LCM_RECALL_FULL_CORPUS_SCAN_ENABLED", "false")
+    monkeypatch.setenv("LCM_RECALL_REFERENCE_STRICT", "false")
+    config = LCMConfig.from_env()
+    assert config.recall_full_corpus_scan_enabled is False
+    assert config.recall_reference_strict is False
+
+    recall_engine._config.recall_reference_strict = False
+    recall_engine._config.embeddings_enabled = False
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_a, **_k: (
+            [
+                {
+                    "kind": "message_excerpt",
+                    "store_id": "legacy-unchecked",
+                    "session_id": "legacy-session",
+                    "snippet": "legacy snippet",
+                    "timestamp": 1.0,
+                }
+            ],
+            None,
+        ),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["detail"] == "snippets"
+    assert payload["hits"][0]["store_id"] == "legacy-unchecked"
+    assert payload["provenance"]["reference_strict"]["enabled"] is False
+
+
 def test_voyage_chunk_recall_uses_context_model(recall_engine, monkeypatch):
     summary = MockProvider()
     summary.provider_id = "voyage"
@@ -502,6 +694,7 @@ def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch)
     """SCAN-1: a recency-bounded chunk arm reports a degraded_reasons entry naming
     the arm + scanned/total, instead of silently truncating."""
     recall_engine._config.recall_scan_rows = 1
+    recall_engine._config.recall_full_corpus_scan_enabled = False
     ids = []
     for i in range(3):
         sid = recall_engine._store.append(
@@ -527,6 +720,7 @@ def test_two_stage_full_approx_coverage_surfaces_as_approximate(recall_engine, m
     the approximate prescreen in degraded_reason (like 'bounded' is disclosed),
     rather than passing as an exact 'full'."""
     recall_engine._config.embedding_binary_prescreen = True
+    recall_engine._config.recall_full_corpus_scan_enabled = False
     node = _add_summary(
         recall_engine, "kanban board dashboard sprint plan",
         session_id="session-a", created_at=10.0,
@@ -551,6 +745,7 @@ def test_pooled_vector_store_survives_across_recall_calls(recall_engine, monkeyp
 
     rc._reset_vector_store_pool()
     try:
+        recall_engine._config.recall_full_corpus_scan_enabled = False
         node = _add_summary(recall_engine, "kanban pooled cache", session_id="session-a", created_at=5.0)
         _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
 

@@ -2828,6 +2828,119 @@ def _lcm_recall_excerpt_expand_hint(hit: dict[str, Any]) -> str:
     return f"lcm_expand(store_id={hit.get('store_id')}, content_offset={offset})"
 
 
+def _lcm_recall_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    if isinstance(value, str) and not value.strip().isdigit():
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _lcm_recall_summary_source_ids(
+    engine: "LCMEngine", node_id: Any, *, max_nodes: int = 64, max_sources: int = 64
+) -> list[int]:
+    """Resolve one summary to bounded raw-source ids without trusting its refs."""
+    root = _lcm_recall_positive_int(node_id)
+    if root is None:
+        return []
+    queue = [root]
+    seen_nodes: set[int] = set()
+    source_ids: list[int] = []
+    while queue and len(seen_nodes) < max_nodes and len(source_ids) < max_sources:
+        current = queue.pop(0)
+        if current in seen_nodes:
+            continue
+        seen_nodes.add(current)
+        try:
+            node = engine._dag.get_node(current)
+        except Exception:  # malformed/corrupt lineage is uncitable, not fatal
+            continue
+        if node is None or not isinstance(node.source_ids, list):
+            continue
+        if node.source_type == "messages":
+            for value in node.source_ids:
+                source_id = _lcm_recall_positive_int(value)
+                if source_id is not None and source_id not in source_ids:
+                    source_ids.append(source_id)
+                    if len(source_ids) >= max_sources:
+                        break
+        elif node.source_type == "nodes":
+            for value in node.source_ids:
+                child_id = _lcm_recall_positive_int(value)
+                if child_id is not None and child_id not in seen_nodes:
+                    queue.append(child_id)
+    return source_ids
+
+
+def _lcm_recall_citable_hit(
+    engine: "LCMEngine", hit: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Hydrate an untrusted candidate to one exact, expandable raw message."""
+    source_node_id: int | None = None
+    if hit.get("kind") == "summary":
+        source_node_id = _lcm_recall_positive_int(hit.get("node_id"))
+        candidate_ids = _lcm_recall_summary_source_ids(engine, source_node_id)
+    else:
+        store_id = _lcm_recall_positive_int(hit.get("store_id"))
+        candidate_ids = [store_id] if store_id is not None else []
+    if not candidate_ids:
+        return None
+    try:
+        rows = engine._store.get_batch(candidate_ids)
+    except Exception:
+        return None
+    row = next(
+        (
+            rows[source_id]
+            for source_id in candidate_ids
+            if source_id in rows and str(rows[source_id].get("content") or "")
+        ),
+        None,
+    )
+    if row is None:
+        return None
+    store_id = _lcm_recall_positive_int(row.get("store_id"))
+    if store_id is None:
+        return None
+    content = str(row.get("content") or "")
+    content_offset = 0
+    excerpt = content[:_LCM_RECALL_SNIPPET_CHARS]
+    span = hit.get("chunk_span")
+    if isinstance(span, dict):
+        start = _lcm_recall_positive_int(span.get("char_start"))
+        if span.get("char_start") == 0 and not isinstance(span.get("char_start"), bool):
+            start = 0
+        end = _lcm_recall_positive_int(span.get("char_end"))
+        if start is not None and end is not None and 0 <= start < end <= len(content):
+            content_offset = start
+            excerpt = content[start:end][:_LCM_RECALL_SNIPPET_CHARS]
+    citable = {
+        "kind": "message_excerpt",
+        "store_id": store_id,
+        "session_id": row.get("session_id"),
+        "timestamp": row.get("timestamp") or 0,
+        "snippet": excerpt,
+        "content_offset": content_offset,
+        "from_current_session": bool(engine.current_session_id)
+        and row.get("session_id") == engine.current_session_id,
+    }
+    if source_node_id is not None:
+        citable["source_node_id"] = source_node_id
+    citable["expand_hint"] = _lcm_recall_excerpt_expand_hint(citable)
+    citable["citation"] = {
+        "tool": "lcm_expand",
+        "store_id": store_id,
+        "content_offset": content_offset,
+    }
+    return citable
+
+
 def _lcm_recall_bounded_reason(
     arm: str, scanned: int | None, total: int | None
 ) -> str:
@@ -2925,6 +3038,9 @@ def _lcm_recall_summary_arm(
             source=None,
             vector_store_cls=VectorStore,
             scan_rows=max(1, int(getattr(engine._config, "recall_scan_rows", 25_000))),
+            full_scan=bool(
+                getattr(engine._config, "recall_full_corpus_scan_enabled", True)
+            ),
         ),
         remaining_s=deadline - time.monotonic(),
         name="lcm-recall-summary-knn",
@@ -2981,6 +3097,9 @@ def _lcm_recall_chunk_arm(
             source=None,
             vector_store_cls=VectorStore,
             scan_rows=max(1, int(getattr(engine._config, "recall_scan_rows", 25_000))),
+            full_scan=bool(
+                getattr(engine._config, "recall_full_corpus_scan_enabled", True)
+            ),
         ),
         remaining_s=deadline - time.monotonic(),
         name="lcm-recall-chunk-knn",
@@ -3104,6 +3223,17 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     include = str(args.get("include") or "all").strip().lower()
     if include not in _LCM_RECALL_VALID_INCLUDE:
         return json.dumps({"error": "include must be one of: all, summaries, verbatim"})
+    requested_detail = str(args.get("detail") or "snippets").strip().lower()
+    if requested_detail not in {"snippets", "answer_ready"}:
+        return json.dumps({"error": "detail must be one of: snippets, answer_ready"})
+    reference_strict_enabled = bool(
+        getattr(engine._config, "recall_reference_strict", True)
+    )
+    detail = (
+        requested_detail
+        if requested_detail != "answer_ready" or reference_strict_enabled
+        else "snippets"
+    )
 
     # lcm_recall fans out three arms + fusion/hydration/rerank, so it uses its own
     # (larger) budget rather than lcm_grep's single-arm query deadline (sprint-opt-2).
@@ -3142,7 +3272,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             timed_out = timed_out or bool(fts_error.get("timeout"))
         else:
             arm_hits["fts"] = hits
-            coverage["fts"] = "ok"
+            coverage["fts"] = "full"
 
     # -- Vector arms. Local/same-model corpora share one query embedding;
     # Voyage's context chunk corpus resolves and embeds with its own model. --
@@ -3357,8 +3487,20 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # -- Response shaping (char-capped) --
     hits_out: list[dict[str, Any]] = []
     response_chars = 0
+    omitted_uncitable = 0
+    delivered_store_ids: set[int] = set()
     for entry in ordered:
         hit = entry["hit"]
+        if detail == "answer_ready":
+            citable = _lcm_recall_citable_hit(engine, hit)
+            if citable is None:
+                omitted_uncitable += 1
+                continue
+            store_id = int(citable["store_id"])
+            if store_id in delivered_store_ids:
+                continue
+            delivered_store_ids.add(store_id)
+            hit = citable
         arms = sorted({arm_order[index] for index in entry["ranks"].keys()})
         item: dict[str, Any] = {
             "kind": hit.get("kind"),
@@ -3376,6 +3518,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             item["store_id"] = hit.get("store_id")
             if hit.get("chunk_span"):
                 item["chunk_span"] = hit["chunk_span"]
+            if hit.get("source_node_id") is not None:
+                item["source_node_id"] = hit["source_node_id"]
+            if hit.get("citation"):
+                item["citation"] = hit["citation"]
         item_chars = len(json.dumps(item, ensure_ascii=False))
         if hits_out and response_chars + item_chars > _LCM_RECALL_RESPONSE_CHAR_CAP:
             break
@@ -3390,6 +3536,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         "limit": limit,
         "scope_bias": scope_bias,
         "include": include,
+        "detail": detail,
         "total_results": len(hits_out),
         "hits": hits_out,
         "provenance": {
@@ -3397,6 +3544,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             "arm_weights": {name: arm_weights[i] for i, name in enumerate(arm_order)},
             "coverage": coverage,
             "rerank": rerank_status,
+            "reference_strict": {
+                "enabled": reference_strict_enabled,
+                "omitted_uncitable": omitted_uncitable,
+            },
             "ordering": (
                 "rrf-fusion -> scope/recency prior -> rerank reorder (top window); "
                 "the reported score is the scope/recency-adjusted RRF score, and "
