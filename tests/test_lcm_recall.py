@@ -160,7 +160,10 @@ def test_answer_ready_backfills_past_malformed_and_missing_references(
     )
     fallback_id = recall_engine._store.append(
         "session-fallback",
-        {"role": "user", "content": "exact citable fallback from durable storage"},
+        {
+            "role": "user",
+            "content": "kanban dashboard sprint exact citable fallback from durable storage",
+        },
     )
     malformed_hits = [
         {
@@ -215,7 +218,7 @@ def test_answer_ready_backfills_past_malformed_and_missing_references(
             "store_id": fallback_id,
             "session_id": "session-fallback",
             "timestamp": payload["hits"][0]["timestamp"],
-            "snippet": "exact citable fallback from durable storage",
+            "snippet": "kanban dashboard sprint exact citable fallback from durable storage",
             "score": payload["hits"][0]["score"],
             "expand_hint": f"lcm_expand(store_id={fallback_id}, content_offset=0)",
             "from_current_session": False,
@@ -396,6 +399,145 @@ def test_answer_ready_summary_selects_source_relevant_to_matched_fact(
     )
 
     assert payload["hits"][0]["store_id"] == relevant_id
+
+
+def test_answer_ready_fts_citation_preserves_late_query_match_offset(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    prefix = "unrelated archive padding " * 16
+    fact = "cobalt orchid launch code is seven"
+    content = prefix + fact + " afterword"
+    store_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": content},
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_a, **_k: ([{
+            "kind": "message_excerpt",
+            "store_id": store_id,
+            "session_id": "session-source",
+            "snippet": fact,
+            "timestamp": 1.0,
+        }], None),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt orchid launch code",
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    expected_offset = content.index("cobalt orchid launch code")
+    assert expected_offset > 300
+    assert payload["hits"][0]["snippet"].startswith(fact)
+    assert payload["hits"][0]["citation"]["content_offset"] == expected_offset
+    assert payload["hits"][0]["expand_hint"] == (
+        f"lcm_expand(store_id={store_id}, content_offset={expected_offset})"
+    )
+
+
+def test_answer_ready_summary_citation_preserves_late_matched_fact_offset(
+    recall_engine, monkeypatch
+):
+    prefix = "unrelated archive padding " * 16
+    fact = "the launch vehicle uses a methane engine"
+    content = prefix + fact + " afterword"
+    source_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": content},
+    )
+    node_id = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary="The launch vehicle uses a methane engine.",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[source_id],
+            source_type="messages",
+            created_at=1.0,
+        )
+    )
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_summary_arm",
+        lambda *_a, **_k: ([{
+            "kind": "summary",
+            "node_id": node_id,
+            "session_id": "session-summary",
+            "snippet": "The launch vehicle uses a methane engine.",
+            "timestamp": 1.0,
+            "from_current_session": False,
+        }], "full", 1, 1),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="rocket propulsion",
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    expected_offset = content.index(fact)
+    assert expected_offset > 300
+    assert payload["hits"][0]["snippet"].startswith(fact)
+    assert payload["hits"][0]["citation"]["content_offset"] == expected_offset
+    assert payload["hits"][0]["source_node_id"] == node_id
+
+
+def test_answer_ready_omits_unverified_fts_match_and_backfills(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    unrelated_id = recall_engine._store.append(
+        "session-unrelated",
+        {"role": "assistant", "content": "weather forecast only"},
+    )
+    fallback_id = recall_engine._store.append(
+        "session-fallback",
+        {"role": "assistant", "content": "cobalt orchid verified fallback"},
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_a, **_k: ([
+            {
+                "kind": "message_excerpt",
+                "store_id": unrelated_id,
+                "session_id": "session-unrelated",
+                "snippet": "forged cobalt orchid preview",
+                "timestamp": 2.0,
+            },
+            {
+                "kind": "message_excerpt",
+                "store_id": fallback_id,
+                "session_id": "session-fallback",
+                "snippet": "cobalt orchid verified fallback",
+                "timestamp": 1.0,
+            },
+        ], None),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt orchid",
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == fallback_id
+    assert payload["provenance"]["reference_strict"]["omitted_uncitable"] == 1
 
 
 def test_answer_ready_summary_without_relevant_source_backfills(
@@ -1011,6 +1153,41 @@ def test_answer_ready_hydration_stops_at_deadline_and_reports_timeout(
     assert payload["timeout"] is True
     assert payload["degraded"] is True
     assert "citation hydration timed out" in payload["degraded_reason"]
+
+
+@pytest.mark.parametrize(
+    ("arm", "include", "scan_name"),
+    [
+        ("summary", "summaries", "run_knn"),
+        ("chunk", "verbatim", "run_chunk_knn"),
+    ],
+)
+def test_full_corpus_scan_timeout_is_degraded(
+    recall_engine, monkeypatch, arm, include, scan_name
+):
+    recall_engine._config.recall_full_corpus_scan_enabled = True
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    calls = []
+
+    def timeout_scan(*_args, **kwargs):
+        calls.append(kwargs)
+        raise TimeoutError(f"simulated {arm} full-corpus scan timeout")
+
+    monkeypatch.setattr(lcm_tools, scan_name, timeout_scan)
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include=include,
+        limit=1,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["full_scan"] is True
+    assert payload["timeout"] is True
+    assert payload["degraded"] is True
+    assert payload["provenance"]["coverage"][arm] == "none"
+    assert f"{arm} arm timed out" in payload["degraded_reason"]
 
 
 @pytest.mark.parametrize("failure_path", ["search", "like_fallback"])

@@ -454,13 +454,19 @@ def _query_terms_for_match_window(query: str | None) -> list[str]:
     return unique
 
 
-def _content_offset_for_query_match(content: str, query: str | None) -> int:
+def _content_offset_for_query_match_or_none(
+    content: str, query: str | None
+) -> int | None:
     folded = content.casefold()
     for term in _query_terms_for_match_window(query):
         index = folded.find(term.casefold())
         if index >= 0:
             return index
-    return 0
+    return None
+
+
+def _content_offset_for_query_match(content: str, query: str | None) -> int:
+    return _content_offset_for_query_match_or_none(content, query) or 0
 
 
 def _full_content_slice(content: str, content_offset: int = 0) -> dict[str, Any]:
@@ -2995,8 +3001,6 @@ def _lcm_recall_citable_hit(
     if store_id is None:
         return None
     content = str(row.get("content") or "")
-    content_offset = 0
-    excerpt = content[:_LCM_RECALL_SNIPPET_CHARS]
     if "chunk_span" in hit:
         span = hit.get("chunk_span")
         if not isinstance(span, dict):
@@ -3013,8 +3017,22 @@ def _lcm_recall_citable_hit(
             return None
         content_offset = start
         excerpt = content[start:end][:_LCM_RECALL_SNIPPET_CHARS]
-        if not excerpt:
+    else:
+        match_offset = _content_offset_for_query_match_or_none(content, query)
+        if match_offset is None and source_node_id is not None:
+            match_offset = _content_offset_for_query_match_or_none(
+                content, str(hit.get("snippet") or "")
+            )
+        if match_offset is None:
             return None
+        content_offset = (
+            match_offset if match_offset >= _LCM_RECALL_SNIPPET_CHARS else 0
+        )
+        excerpt = content[
+            content_offset:content_offset + _LCM_RECALL_SNIPPET_CHARS
+        ]
+    if not excerpt:
+        return None
     _lcm_recall_require_deadline(deadline, "candidate hydration")
     citable = {
         "kind": "message_excerpt",
@@ -3476,6 +3494,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     except TimeoutError:
                         timed_out = True
                         coverage["summary"] = "none"
+                        degraded_reasons.append("summary arm timed out")
                     except Exception as exc:  # noqa: BLE001
                         coverage["summary"] = "none"
                         degraded_reasons.append(f"summary arm failed: {exc}")
@@ -3504,6 +3523,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     except TimeoutError:
                         timed_out = True
                         coverage["chunk"] = "none"
+                        degraded_reasons.append("chunk arm timed out")
                     except Exception as exc:  # noqa: BLE001
                         coverage["chunk"] = "none"
                         degraded_reasons.append(f"chunk arm failed: {exc}")
