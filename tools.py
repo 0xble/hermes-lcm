@@ -73,6 +73,7 @@ from .search_query import (
     extract_quoted_phrases,
     extract_search_terms,
     normalize_search_sort,
+    requires_like_fallback,
 )
 from .session_patterns import build_session_match_keys, compile_session_pattern
 from .sqlite_util import _sqlite_savepoint
@@ -444,6 +445,11 @@ def _query_terms_for_match_window(query: str | None) -> list[str]:
             token = token.rsplit(":", 1)[-1]
         if len(token) >= 2:
             add_term(token)
+    if not terms and requires_like_fallback(query):
+        # LIKE supports exact raw terms that FTS/window tokenization cannot
+        # represent, notably emoji-only queries. Keep that literal intact so
+        # hydration can verify the same match and retain truthful offsets.
+        add_term(query)
     seen: set[str] = set()
     unique: list[str] = []
     for term in sorted(terms, key=len, reverse=True):
@@ -2996,10 +3002,10 @@ def _lcm_recall_relevant_summary_row(
         summary_score = compute_directness_score(
             content, summary_terms, summary_phrases
         )
-        if query_score > 0:
-            rank = (2.0, query_score, summary_score, -index)
-        elif summary_score > 0:
-            rank = (1.0, summary_score, 0.0, -index)
+        if summary_score > 0:
+            rank = (2.0, summary_score, query_score, -index)
+        elif query_score > 0:
+            rank = (1.0, query_score, 0.0, -index)
         else:
             continue
         if best is None or rank > best[0]:

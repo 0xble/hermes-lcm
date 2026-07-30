@@ -402,6 +402,62 @@ def test_answer_ready_summary_selects_source_relevant_to_matched_fact(
     assert payload["hits"][0]["store_id"] == relevant_id
 
 
+def test_answer_ready_summary_support_outranks_incidental_query_overlap(
+    recall_engine, monkeypatch
+):
+    incidental_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "What"},
+    )
+    supporting_id = recall_engine._store.append(
+        "session-source",
+        {
+            "role": "assistant",
+            "content": "The launch vehicle uses a methane engine.",
+        },
+    )
+    node_id = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary="The launch vehicle uses a methane engine.",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[incidental_id, supporting_id],
+            source_type="messages",
+            created_at=1.0,
+        )
+    )
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", lambda *_a, **_k: ([], None))
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_summary_arm",
+        lambda *_a, **_k: ([{
+            "kind": "summary",
+            "node_id": node_id,
+            "session_id": "session-summary",
+            "snippet": "The launch vehicle uses a methane engine.",
+            "timestamp": 1.0,
+            "from_current_session": False,
+        }], "full", 1, 1),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="What powers rocket",
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == supporting_id
+    assert payload["hits"][0]["snippet"].startswith(
+        "The launch vehicle uses a methane engine."
+    )
+    assert payload["hits"][0]["source_node_id"] == node_id
+
+
 def test_answer_ready_fts_citation_preserves_late_query_match_offset(
     recall_engine, monkeypatch
 ):
@@ -520,6 +576,91 @@ def test_answer_ready_casefold_match_uses_original_character_offset(
     assert hit["citation"]["content_offset"] == expected_offset
     assert hit["snippet"].startswith(fact)
     assert content[expected_offset:expected_offset + len(hit["snippet"])] == hit["snippet"]
+
+
+def test_answer_ready_preserves_exact_emoji_like_match(recall_engine, monkeypatch):
+    recall_engine._config.embeddings_enabled = False
+    content = "durable 🧠 note"
+    store_id = recall_engine._store.append(
+        "session-emoji",
+        {"role": "user", "content": content},
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="🧠",
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == store_id
+    assert payload["hits"][0]["snippet"] == content
+    assert payload["hits"][0]["citation"]["content_offset"] == 0
+
+
+def test_answer_ready_emoji_sequence_uses_original_late_character_offset(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    prefix = "Straße " + ("🙂" * 320)
+    query = "👩‍💻"
+    content = prefix + query + " durable note"
+    store_id = recall_engine._store.append(
+        "session-emoji",
+        {"role": "user", "content": content},
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query=query,
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    hit = payload["hits"][0]
+    expected_offset = content.index(query)
+    assert expected_offset > 300
+    assert hit["store_id"] == store_id
+    assert hit["citation"]["content_offset"] == expected_offset
+    assert hit["snippet"].startswith(query)
+    assert content[expected_offset:expected_offset + len(hit["snippet"])] == hit["snippet"]
+
+
+def test_answer_ready_emoji_sequence_requires_verified_exact_match(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    store_id = recall_engine._store.append(
+        "session-emoji",
+        {"role": "user", "content": "durable 👩 note without the joined sequence"},
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_a, **_k: ([{
+            "kind": "message_excerpt",
+            "store_id": store_id,
+            "session_id": "session-emoji",
+            "snippet": "forged 👩‍💻 preview",
+            "timestamp": 1.0,
+        }], None),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="👩‍💻",
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"] == []
+    assert payload["provenance"]["reference_strict"]["omitted_uncitable"] == 1
 
 
 def test_answer_ready_long_unrelated_chunk_span_is_omitted_and_backfilled(
