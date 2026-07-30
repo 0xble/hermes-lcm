@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_lcm.tools as lcm_tools
+from hermes_lcm import store as store_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.store import MessageStore
@@ -440,6 +441,131 @@ def test_answer_ready_fts_citation_preserves_late_query_match_offset(
     assert payload["hits"][0]["expand_hint"] == (
         f"lcm_expand(store_id={store_id}, content_offset={expected_offset})"
     )
+
+
+@pytest.mark.parametrize("match_start", [299, 294])
+def test_answer_ready_boundary_match_is_complete_and_offsets_are_truthful(
+    recall_engine, monkeypatch, match_start
+):
+    recall_engine._config.embeddings_enabled = False
+    fact = "cobalt orchid launch code is seven"
+    content = ("x" * match_start) + fact + " afterword"
+    store_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": content},
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_a, **_k: ([{
+            "kind": "message_excerpt",
+            "store_id": store_id,
+            "session_id": "session-source",
+            "snippet": fact,
+            "timestamp": 1.0,
+        }], None),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt orchid launch code",
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    hit = payload["hits"][0]
+    offset = hit["citation"]["content_offset"]
+    assert fact in hit["snippet"]
+    assert content[offset:offset + len(hit["snippet"])] == hit["snippet"]
+    assert offset <= match_start
+    assert match_start + len("cobalt orchid launch code") <= offset + len(hit["snippet"])
+
+
+def test_answer_ready_casefold_match_uses_original_character_offset(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    prefix = "Straße " + ("🙂" * 320)
+    fact = "cobalt orchid launch code"
+    content = prefix + fact
+    store_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": content},
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_a, **_k: ([{
+            "kind": "message_excerpt",
+            "store_id": store_id,
+            "session_id": "session-source",
+            "snippet": fact,
+            "timestamp": 1.0,
+        }], None),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="COBALT ORCHID LAUNCH CODE",
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    hit = payload["hits"][0]
+    expected_offset = content.index(fact)
+    assert hit["citation"]["content_offset"] == expected_offset
+    assert hit["snippet"].startswith(fact)
+    assert content[expected_offset:expected_offset + len(hit["snippet"])] == hit["snippet"]
+
+
+def test_answer_ready_long_unrelated_chunk_span_is_omitted_and_backfilled(
+    recall_engine, monkeypatch
+):
+    unrelated_id = recall_engine._store.append(
+        "session-unrelated",
+        {"role": "assistant", "content": "x" * 600},
+    )
+    fallback_id = recall_engine._store.append(
+        "session-fallback",
+        {"role": "assistant", "content": "cobalt orchid verified fallback"},
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_recall_fts_arm",
+        lambda *_a, **_k: ([
+            {
+                "kind": "message_excerpt",
+                "store_id": unrelated_id,
+                "session_id": "session-unrelated",
+                "snippet": "forged cobalt orchid preview",
+                "timestamp": 2.0,
+                "chunk_span": {"char_start": 0, "char_end": 600},
+            },
+            {
+                "kind": "message_excerpt",
+                "store_id": fallback_id,
+                "session_id": "session-fallback",
+                "snippet": "cobalt orchid verified fallback",
+                "timestamp": 1.0,
+            },
+        ], None),
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt orchid",
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == fallback_id
+    assert payload["provenance"]["reference_strict"]["omitted_uncitable"] == 1
 
 
 def test_answer_ready_summary_citation_preserves_late_matched_fact_offset(
@@ -1218,6 +1344,94 @@ def test_recall_reports_full_text_failures_instead_of_full_empty_coverage(
     assert payload["provenance"]["coverage"]["fts"] == "none"
     assert payload["degraded"] is True
     assert "full-text arm unavailable" in payload["degraded_reason"]
+
+
+def test_recall_like_fallback_reports_bounded_coverage_when_older_match_is_omitted(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    old_exact = recall_engine._store.append(
+        "session-old",
+        {"role": "assistant", "content": "cobalt orchid exact durable fact"},
+    )
+    recent_partial = recall_engine._store.append(
+        "session-new",
+        {"role": "assistant", "content": "cobalt only recent partial"},
+    )
+    monkeypatch.setattr(store_module, "compute_search_candidate_cap", lambda _limit: 1)
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt/orchid",
+        include="verbatim",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == recent_partial
+    assert old_exact not in {hit["store_id"] for hit in payload["hits"]}
+    assert payload["provenance"]["coverage"]["fts"] == "bounded"
+    assert payload["degraded"] is True
+    assert "LIKE fallback" in payload["degraded_reason"]
+
+
+@pytest.mark.parametrize(
+    ("query", "content"),
+    [
+        ("alpha/beta", "alpha beta punctuation route"),
+        ("記憶", "古い記憶の記録"),
+        ("🧠", "durable 🧠 note"),
+    ],
+)
+def test_recall_like_routes_disclose_bounded_coverage(
+    recall_engine, monkeypatch, query, content
+):
+    recall_engine._config.embeddings_enabled = False
+    recall_engine._store.append(
+        "session-old",
+        {"role": "assistant", "content": content},
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query=query,
+        include="verbatim",
+        limit=1,
+    )
+
+    assert payload["hits"]
+    assert payload["provenance"]["coverage"]["fts"] == "bounded"
+    assert payload["degraded"] is True
+    assert "LIKE fallback" in payload["degraded_reason"]
+
+
+def test_recall_like_fallback_timeout_is_never_reported_as_full(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    monkeypatch.setattr(
+        lcm_tools,
+        "_lcm_grep_full_text_with_deadline",
+        lambda *_a, **_k: {
+            "error": "lcm_grep request deadline exceeded",
+            "mode": "recall",
+            "timeout": True,
+        },
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="cobalt/orchid",
+        include="verbatim",
+        limit=1,
+    )
+
+    assert payload["hits"] == []
+    assert payload["provenance"]["coverage"]["fts"] == "none"
+    assert payload["degraded"] is True
+    assert payload["timeout"] is True
 
 
 def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch):

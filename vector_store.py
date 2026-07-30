@@ -1593,7 +1593,11 @@ class VectorStore:
                         key=lambda row: (-float(row[2]), -int(row[0]), str(row[1])),
                     )[:k]
         finally:
-            if started_read_transaction and conn.in_transaction:
+            # The caller may have installed a deadline progress handler. Once
+            # cleanup starts it must not interrupt ROLLBACK and strand this
+            # pooled connection on the scan's read snapshot.
+            conn.set_progress_handler(None, 0)
+            if conn.in_transaction:
                 conn.rollback()
 
         candidates = [

@@ -457,12 +457,64 @@ def _query_terms_for_match_window(query: str | None) -> list[str]:
 def _content_offset_for_query_match_or_none(
     content: str, query: str | None
 ) -> int | None:
-    folded = content.casefold()
+    match = _query_match_span_or_none(content, query)
+    return None if match is None else match[0]
+
+
+def _casefold_with_original_offsets(text: str) -> tuple[str, list[int]]:
+    """Casefold text while retaining a map back to Python character offsets."""
+    folded_parts: list[str] = []
+    offsets: list[int] = []
+    for index, char in enumerate(text):
+        folded = char.casefold()
+        folded_parts.append(folded)
+        offsets.extend([index] * len(folded))
+    return "".join(folded_parts), offsets
+
+
+def _query_match_span_or_none(
+    content: str, query: str | None
+) -> tuple[int, int] | None:
+    """Return one verified query-match span in original character offsets."""
+    if not content or not query:
+        return None
+    folded, original_offsets = _casefold_with_original_offsets(content)
+    if not folded or not original_offsets:
+        return None
     for term in _query_terms_for_match_window(query):
-        index = folded.find(term.casefold())
-        if index >= 0:
-            return index
+        needle = term.casefold()
+        if not needle:
+            continue
+        folded_start = folded.find(needle)
+        if folded_start < 0:
+            continue
+        folded_end = folded_start + len(needle)
+        return original_offsets[folded_start], original_offsets[folded_end - 1] + 1
     return None
+
+
+def _content_window_for_query_match_or_none(
+    content: str,
+    query: str | None,
+    *,
+    max_chars: int = _LCM_RECALL_SNIPPET_CHARS,
+) -> tuple[int, str] | None:
+    """Return a bounded evidence window that fully contains a verified match."""
+    match = _query_match_span_or_none(content, query)
+    if match is None:
+        return None
+    match_start, match_end = match
+    if match_end <= max_chars:
+        # Preserve the historical offset-0 window whenever the complete match
+        # fits; callers already rely on that compatibility behavior.
+        return 0, content[:max_chars]
+    if match_end - match_start > max_chars:
+        return None
+    window_start = match_start
+    window_end = min(len(content), window_start + max_chars)
+    if not (window_start <= match_start and match_end <= window_end):
+        return None
+    return window_start, content[window_start:window_end]
 
 
 def _content_offset_for_query_match(content: str, query: str | None) -> int:
@@ -1833,6 +1885,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     has_current_session = bool(current_session_id)
     results: list[Dict[str, Any]] = []
     search_failures: list[str] = []
+    message_search_coverage = "full"
 
     if content_scope in {"history", "both"}:
         try:
@@ -1846,6 +1899,9 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 role=role,
                 time_from=time_from,
                 time_to=time_to,
+            )
+            message_search_coverage = str(
+                getattr(msg_hits, "coverage", "full") or "full"
             )
             for hit in msg_hits:
                 results.append(
@@ -2121,6 +2177,8 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
         response["degraded"] = True
         response["degraded_reason"] = "; ".join(search_failures)
         response["search_failures"] = search_failures
+    if str(args.get("mode") or "").lower() == "recall":
+        response["_message_search_coverage"] = message_search_coverage
     return json.dumps(response)
 
 
@@ -3015,22 +3073,30 @@ def _lcm_recall_citable_hit(
             or not 0 <= start < end <= len(content)
         ):
             return None
-        content_offset = start
-        excerpt = content[start:end][:_LCM_RECALL_SNIPPET_CHARS]
+        chunk_content = content[start:end]
+        if len(chunk_content) <= _LCM_RECALL_SNIPPET_CHARS:
+            # A valid chunk span is authoritative and can be cited whole.
+            content_offset = start
+            excerpt = chunk_content
+        else:
+            window = _content_window_for_query_match_or_none(chunk_content, query)
+            if window is None:
+                window = _content_window_for_query_match_or_none(
+                    chunk_content, str(hit.get("snippet") or "")
+                )
+            if window is None:
+                return None
+            local_offset, excerpt = window
+            content_offset = start + local_offset
     else:
-        match_offset = _content_offset_for_query_match_or_none(content, query)
-        if match_offset is None and source_node_id is not None:
-            match_offset = _content_offset_for_query_match_or_none(
+        window = _content_window_for_query_match_or_none(content, query)
+        if window is None and source_node_id is not None:
+            window = _content_window_for_query_match_or_none(
                 content, str(hit.get("snippet") or "")
             )
-        if match_offset is None:
+        if window is None:
             return None
-        content_offset = (
-            match_offset if match_offset >= _LCM_RECALL_SNIPPET_CHARS else 0
-        )
-        excerpt = content[
-            content_offset:content_offset + _LCM_RECALL_SNIPPET_CHARS
-        ]
+        content_offset, excerpt = window
     if not excerpt:
         return None
     _lcm_recall_require_deadline(deadline, "candidate hydration")
@@ -3109,6 +3175,9 @@ def _lcm_recall_fts_arm(
     )
     if "error" in payload:
         return [], payload
+    message_coverage = str(
+        payload.get("_message_search_coverage") or "full"
+    )
     if payload.get("degraded"):
         return [], {
             "error": payload.get("degraded_reason") or "full-text search degraded",
@@ -3132,6 +3201,8 @@ def _lcm_recall_fts_arm(
         }
         hit["expand_hint"] = _lcm_recall_excerpt_expand_hint(hit)
         hits.append(hit)
+    if message_coverage != "full":
+        return hits, {"coverage": message_coverage}
     return hits, None
 
 
@@ -3380,18 +3451,28 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # -- FTS arm (the default-on value: works with embeddings disabled) --
     if run_fts:
         try:
-            hits, fts_error = _lcm_recall_fts_arm(
+            hits, fts_status = _lcm_recall_fts_arm(
                 engine, query, candidate_limit=candidate_limit, deadline=deadline
             )
         except (_WorkerCapacityError, TimeoutError) as exc:
-            hits, fts_error = [], {"error": str(exc)}
-        if fts_error is not None:
+            hits, fts_status = [], {"error": str(exc)}
+        if fts_status is not None and "error" in fts_status:
             coverage["fts"] = "none"
             degraded_reasons.append("full-text arm unavailable")
-            timed_out = timed_out or bool(fts_error.get("timeout"))
+            timed_out = timed_out or bool(fts_status.get("timeout"))
         else:
             arm_hits["fts"] = hits
-            coverage["fts"] = "full"
+            fts_coverage = (
+                str(fts_status.get("coverage") or "bounded")
+                if fts_status is not None
+                else "full"
+            )
+            coverage["fts"] = fts_coverage
+            if fts_coverage != "full":
+                degraded_reasons.append(
+                    "full-text arm coverage bounded: LIKE fallback did not scan "
+                    "the complete all-time candidate set"
+                )
 
     # -- Vector arms. Local/same-model corpora share one query embedding;
     # Voyage's context chunk corpus resolves and embeds with its own model. --
