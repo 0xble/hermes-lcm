@@ -413,8 +413,41 @@ def test_full_scan_reaches_best_vector_outside_recency_bound(tmp_path):
         assert bounded.coverage == "bounded"
         assert [row[0] for row in bounded] == [str(newest)]
         assert exhaustive.coverage == "full"
+        assert exhaustive.reason is None
         assert exhaustive.scanned == exhaustive.total == 2
         assert [row[0] for row in exhaustive] == [str(oldest)]
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_full_scan_reports_incomplete_coverage_when_vector_decode_fails(tmp_path):
+    db_path = tmp_path / "full-scan-malformed.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        valid = _add_summary(dag, created_at=1.0)
+        malformed = _add_summary(dag, created_at=2.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, valid, "summary", "full-scan", [1.0, 0.0])
+        _record_embedding(store, malformed, "summary", "full-scan", [0.0, 1.0])
+        store.connection.execute(
+            "UPDATE lcm_embedding_vectors SET vec = ? WHERE embedded_id = ?",
+            (sqlite3.Binary(b"\x00"), str(malformed)),
+        )
+
+        result = store.knn(
+            [1.0, 0.0],
+            k=2,
+            model="full-scan",
+            full_scan=True,
+        )
+
+        assert result.coverage == "bounded"
+        assert result.reason == "malformed_vectors_skipped"
+        assert result.scanned == 1
+        assert result.total == 2
+        assert [row[0] for row in result] == [str(valid)]
     finally:
         store.close()
         dag.close()

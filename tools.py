@@ -3093,6 +3093,27 @@ def _lcm_recall_relevant_summary_row(
     return best[1] if best is not None else None
 
 
+def _lcm_recall_summary_evidence_window(
+    content: str,
+    matched_summary: str,
+) -> tuple[int, str] | None:
+    """Locate the tightest bounded window supported by the selected source row."""
+    folded_content = content.casefold()
+    overlapping_terms: list[str] = []
+    seen: set[str] = set()
+    for term in extract_search_terms(matched_summary):
+        cleaned = term.strip().replace('"', " ")
+        key = cleaned.casefold()
+        if not cleaned or key in seen or key not in folded_content:
+            continue
+        seen.add(key)
+        overlapping_terms.append(cleaned)
+    if not overlapping_terms:
+        return None
+    evidence_query = " AND ".join(f'"{term}"' for term in overlapping_terms)
+    return _content_window_for_query_match_or_none(content, evidence_query)
+
+
 def _lcm_recall_citable_hit(
     engine: "LCMEngine",
     hit: dict[str, Any],
@@ -3102,6 +3123,9 @@ def _lcm_recall_citable_hit(
 ) -> dict[str, Any] | None:
     """Hydrate an untrusted candidate to one exact, expandable raw message."""
     _lcm_recall_require_deadline(deadline, "candidate hydration")
+    matched_summary = str(
+        hit.get("_matched_summary") or hit.get("snippet") or ""
+    )
     source_node_id: int | None = None
     if hit.get("kind") == "summary":
         source_node_id = _lcm_recall_positive_int(hit.get("node_id"))
@@ -3126,7 +3150,7 @@ def _lcm_recall_citable_hit(
             rows,
             candidate_ids,
             query=query,
-            matched_summary=str(hit.get("snippet") or ""),
+            matched_summary=matched_summary,
             deadline=deadline,
         )
     else:
@@ -3166,9 +3190,14 @@ def _lcm_recall_citable_hit(
         else:
             window = _content_window_for_query_match_or_none(chunk_content, query)
             if window is None:
-                window = _content_window_for_query_match_or_none(
-                    chunk_content, str(hit.get("snippet") or "")
-                )
+                if source_node_id is not None:
+                    window = _lcm_recall_summary_evidence_window(
+                        chunk_content, matched_summary
+                    )
+                else:
+                    window = _content_window_for_query_match_or_none(
+                        chunk_content, str(hit.get("snippet") or "")
+                    )
             if window is None:
                 return None
             local_offset, excerpt = window
@@ -3176,8 +3205,8 @@ def _lcm_recall_citable_hit(
     else:
         window = _content_window_for_query_match_or_none(content, query)
         if window is None and source_node_id is not None:
-            window = _content_window_for_query_match_or_none(
-                content, str(hit.get("snippet") or "")
+            window = _lcm_recall_summary_evidence_window(
+                content, matched_summary
             )
         if window is None:
             return None
@@ -3211,15 +3240,14 @@ def _lcm_recall_bounded_reason(
 ) -> str:
     """Degraded-reasons text for a ``coverage='bounded'`` arm (SCAN-1).
 
-    Names the arm and the scanned/total ratio so a caller can see that the arm
-    scored only the most-recent slice of the corpus (older archived vectors were
-    excluded by the recency-bounded candidate scan), rather than the truncation
-    being silent.
+    Names the arm and the scored/total ratio without assuming why coverage was
+    incomplete. Bounded candidate scans can exclude older vectors, while exact
+    scans can skip malformed live rows that cannot be scored.
     """
     if scanned is not None and total is not None:
         return (
-            f"{arm} arm coverage bounded: scored the {scanned} most-recent of "
-            f"{total} vectors (older vectors excluded)"
+            f"{arm} arm coverage bounded: scored {scanned} of {total} vectors; "
+            "some live vectors were excluded or unreadable"
         )
     return (
         f"{arm} arm coverage bounded: scored only the most-recent slice of the "
@@ -3342,6 +3370,7 @@ def _lcm_recall_summary_arm(
             "node_id": node.node_id,
             "session_id": node.session_id,
             "timestamp": node.latest_at or node.created_at or 0,
+            "_matched_summary": node.summary or "",
             "snippet": (node.summary or "")[:_LCM_RECALL_SNIPPET_CHARS],
             "from_current_session": bool(current) and node.session_id == current,
         }

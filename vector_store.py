@@ -235,9 +235,10 @@ class KNNResult(list[tuple[str, float, str]]):
         super().__init__(rows)
         self.coverage = coverage
         self.reason = reason
-        # Bounded-coverage provenance: how many of the corpus's live vectors were
-        # actually scored (``scanned``) out of the total live for the identity
-        # (``total``), so a caller can surface partial-archive coverage (SCAN-1).
+        # Coverage provenance: how many of the corpus's live vectors were actually
+        # scored (``scanned``) out of the total live rows examined (``total``).
+        # This surfaces both recency bounds and malformed rows skipped by an exact
+        # full scan instead of overstating either path as complete.
         self.scanned = scanned
         self.total = total
 
@@ -1491,7 +1492,9 @@ class VectorStore:
         )
         batch_size = min(1024, max(1, int(self.bounded_scan_rows or 1)))
         last_rowid = 0
-        scanned = 0
+        total = 0
+        scored = 0
+        skipped = 0
         best: list[tuple[int, str, float, str]] = []
         summary_columns = self._table_columns("summary_nodes")
         suppression = (
@@ -1547,7 +1550,7 @@ class VectorStore:
                 if not rows:
                     break
                 last_rowid = int(rows[-1]["rowid"])
-                scanned += len(rows)
+                total += len(rows)
                 rowids: list[int] = []
                 embedded_ids: list[str] = []
                 kinds: list[str] = []
@@ -1562,13 +1565,16 @@ class VectorStore:
                     try:
                         vector = self._decode_stored_vec(bytes(row["vec"]), dim, dtype)
                     except (TypeError, ValueError):
+                        skipped += 1
                         continue
                     if vector is None:
+                        skipped += 1
                         continue
                     rowids.append(int(row["rowid"]))
                     embedded_ids.append(str(row["embedded_id"]))
                     kinds.append(str(row["embedded_kind"]))
                     vectors.append(vector)
+                scored += len(vectors)
                 if vectors:
                     if numpy is not None:
                         assert query_array is not None
@@ -1604,11 +1610,13 @@ class VectorStore:
             (str(embedded_id), float(score), str(kind))
             for _, embedded_id, score, kind in best
         ]
+        coverage = "none" if not scored else "bounded" if skipped else "full"
         return KNNResult(
             candidates,
-            coverage="full" if scanned else "none",
-            scanned=scanned,
-            total=scanned,
+            coverage=coverage,
+            reason="malformed_vectors_skipped" if skipped else None,
+            scanned=scored,
+            total=total,
         )
 
     def _source_allowed_ids(self, table: str, source: str) -> set[str]:

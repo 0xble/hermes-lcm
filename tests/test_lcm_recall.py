@@ -402,6 +402,52 @@ def test_answer_ready_summary_selects_source_relevant_to_matched_fact(
     assert payload["hits"][0]["store_id"] == relevant_id
 
 
+def test_answer_ready_summary_uses_matched_fact_beyond_display_preview(
+    recall_engine, monkeypatch
+):
+    preview_source_id = recall_engine._store.append(
+        "session-source",
+        {"role": "assistant", "content": "archive"},
+    )
+    supporting_id = recall_engine._store.append(
+        "session-source",
+        {
+            "role": "assistant",
+            "content": "the launch vehicle uses a methane engine",
+        },
+    )
+    prefix = "archive " * 40
+    fact = "the launch vehicle uses a methane engine"
+    summary = prefix + fact
+    assert len(prefix) > 300
+    node_id = recall_engine._dag.add_node(
+        SummaryNode(
+            session_id="session-summary",
+            depth=0,
+            summary=summary,
+            token_count=50,
+            source_token_count=100,
+            source_ids=[preview_source_id, supporting_id],
+            source_type="messages",
+            created_at=1.0,
+        )
+    )
+    _seed_summary_vectors(recall_engine, [(node_id, [1.0, 0.0])])
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="rocket propulsion",
+        include="summaries",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == supporting_id
+    assert payload["hits"][0]["snippet"] == fact
+    assert payload["hits"][0]["source_node_id"] == node_id
+
+
 def test_answer_ready_summary_support_outranks_incidental_query_overlap(
     recall_engine, monkeypatch
 ):
