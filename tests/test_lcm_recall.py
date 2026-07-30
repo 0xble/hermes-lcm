@@ -499,6 +499,64 @@ def test_answer_ready_fts_citation_preserves_late_query_match_offset(
     )
 
 
+def test_answer_ready_implicit_and_backfills_when_terms_do_not_fit_one_window(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    fallback_id = recall_engine._store.append(
+        "session-fallback",
+        {"role": "assistant", "content": "alpha omega verified fallback"},
+    )
+    incomplete_id = recall_engine._store.append(
+        "session-incomplete",
+        {"role": "assistant", "content": "alpha" + (" " * 400) + "omega"},
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query="alpha omega",
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == fallback_id
+    assert payload["hits"][0]["store_id"] != incomplete_id
+    assert "alpha" in payload["hits"][0]["snippet"]
+    assert "omega" in payload["hits"][0]["snippet"]
+    assert payload["provenance"]["reference_strict"]["omitted_uncitable"] == 1
+
+
+def test_answer_ready_quoted_phrase_and_term_must_fit_one_window(
+    recall_engine, monkeypatch
+):
+    recall_engine._config.embeddings_enabled = False
+    fallback_id = recall_engine._store.append(
+        "session-fallback",
+        {"role": "assistant", "content": "alpha beta omega verified fallback"},
+    )
+    incomplete_id = recall_engine._store.append(
+        "session-incomplete",
+        {"role": "assistant", "content": "alpha beta" + (" " * 400) + "omega"},
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        query='"alpha beta" omega',
+        include="verbatim",
+        detail="answer_ready",
+        limit=1,
+    )
+
+    assert payload["hits"][0]["store_id"] == fallback_id
+    assert payload["hits"][0]["store_id"] != incomplete_id
+    assert "alpha beta" in payload["hits"][0]["snippet"]
+    assert "omega" in payload["hits"][0]["snippet"]
+    assert payload["provenance"]["reference_strict"]["omitted_uncitable"] == 1
+
+
 @pytest.mark.parametrize("match_start", [299, 294])
 def test_answer_ready_boundary_match_is_complete_and_offsets_are_truthful(
     recall_engine, monkeypatch, match_start

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import heapq
 import json
 import logging
 import re
@@ -460,6 +461,47 @@ def _query_terms_for_match_window(query: str | None) -> list[str]:
     return unique
 
 
+def _query_conjuncts_for_match_window(query: str | None) -> list[str]:
+    """Return lexical requirements for a simple implicit/explicit AND query."""
+    if not query or requires_like_fallback(query):
+        return []
+    quoted_phrases = [
+        phrase.strip() for phrase in re.findall(r'"([^"]+)"', query) if phrase.strip()
+    ]
+    unquoted = re.sub(r'"[^"]+"', " ", query)
+    tokens = re.findall(r"[\w][\w:-]*\*?", unquoted)
+    if any(token.upper() == "OR" for token in tokens):
+        # OR branches are alternatives, not a set of jointly required evidence.
+        return []
+
+    conjuncts = list(quoted_phrases)
+    skip_negated = False
+    for token in tokens:
+        operator = token.upper()
+        if operator == "NOT":
+            skip_negated = True
+            continue
+        if operator in {"AND", "NEAR"}:
+            continue
+        if skip_negated:
+            skip_negated = False
+            continue
+        token = token.rstrip("*").strip()
+        if ":" in token:
+            token = token.rsplit(":", 1)[-1]
+        if len(token) >= 2:
+            conjuncts.append(token)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for conjunct in conjuncts:
+        key = conjunct.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(conjunct)
+    return unique
+
+
 def _content_offset_for_query_match_or_none(
     content: str, query: str | None
 ) -> int | None:
@@ -487,6 +529,43 @@ def _query_match_span_or_none(
     folded, original_offsets = _casefold_with_original_offsets(content)
     if not folded or not original_offsets:
         return None
+    conjuncts = _query_conjuncts_for_match_window(query)
+    if conjuncts:
+        needles = [conjunct.casefold() for conjunct in conjuncts]
+        heap: list[tuple[int, int, int, int]] = []
+        max_end = 0
+        for needle_index, needle in enumerate(needles):
+            if not needle:
+                return None
+            folded_start = folded.find(needle)
+            if folded_start < 0:
+                return None
+            folded_end = folded_start + len(needle)
+            start = original_offsets[folded_start]
+            end = original_offsets[folded_end - 1] + 1
+            heapq.heappush(heap, (start, end, needle_index, folded_start))
+            max_end = max(max_end, end)
+
+        best: tuple[int, int] | None = None
+        while heap:
+            min_start, _end, needle_index, folded_start = heapq.heappop(heap)
+            candidate = (min_start, max_end)
+            if best is None or candidate[1] - candidate[0] < best[1] - best[0]:
+                best = candidate
+            needle = needles[needle_index]
+            next_folded_start = folded.find(needle, folded_start + 1)
+            if next_folded_start < 0:
+                break
+            next_folded_end = next_folded_start + len(needle)
+            next_start = original_offsets[next_folded_start]
+            next_end = original_offsets[next_folded_end - 1] + 1
+            heapq.heappush(
+                heap,
+                (next_start, next_end, needle_index, next_folded_start),
+            )
+            max_end = max(max_end, next_end)
+        return best
+
     for term in _query_terms_for_match_window(query):
         needle = term.casefold()
         if not needle:
