@@ -49,6 +49,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .sqlite_util import _temporary_sqlite_busy_timeout
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -1101,18 +1102,22 @@ class MessageStore:
             try:
                 # Separate MessageStore instances have separate Python locks.
                 # Acquire SQLite's write reservation before reading so this
-                # read-modify-write serializes across every connection.
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT value FROM metadata WHERE key = ?",
-                    (key,),
-                ).fetchone()
-                try:
-                    existing = json.loads(str(row[0])) if row and row[0] else {}
-                except (ValueError, TypeError):
-                    existing = {}
-                if not isinstance(existing, dict):
-                    existing = {}
+                # read-modify-write serializes across every connection. This is
+                # best-effort telemetry on the completed-compaction hot path, so
+                # permit only a tightly bounded overlap before skipping instead
+                # of inheriting the connection's 30s wait.
+                with _temporary_sqlite_busy_timeout([conn], 100):
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute(
+                        "SELECT value FROM metadata WHERE key = ?",
+                        (key,),
+                    ).fetchone()
+                    try:
+                        existing = json.loads(str(row[0])) if row and row[0] else {}
+                    except (ValueError, TypeError):
+                        existing = {}
+                    if not isinstance(existing, dict):
+                        existing = {}
 
                 # Per-runtime high-water marks make a committed increment
                 # idempotent when its caller observes an ambiguous exception.
@@ -1160,8 +1165,31 @@ class MessageStore:
                     or current_total < 0
                 ):
                     current_total = 0
+                proposed_total = updates.get("total_compactions", current_total)
+                if (
+                    isinstance(proposed_total, bool)
+                    or not isinstance(proposed_total, int)
+                    or proposed_total < 0
+                ):
+                    proposed_total = current_total
+                stale_across_compaction = (
+                    effective_increment == 0 and proposed_total < current_total
+                )
                 record = dict(existing)
-                record.update(updates)
+                if stale_across_compaction:
+                    compaction_sensitive = {
+                        "turns_since_leaf_compaction",
+                        "peak_prompt_tokens_since_leaf_compaction",
+                        "last_leaf_compaction_at",
+                        "last_compaction_duration_ms",
+                    }
+                    record.update(
+                        (field, value)
+                        for field, value in updates.items()
+                        if field not in compaction_sensitive
+                    )
+                else:
+                    record.update(updates)
                 record["conversation_id"] = conversation_id
                 record["counter_epoch_watermarks"] = watermarks
                 record["total_compactions"] = current_total + effective_increment

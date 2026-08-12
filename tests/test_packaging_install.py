@@ -1448,6 +1448,60 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
     ctx.engine.shutdown()
 
 
+def test_post_llm_hook_does_not_foreground_match_side_channel_clone(monkeypatch, tmp_path):
+    module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_side_channel_clone")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "side-channel")
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+    assert ctx.engine is not None
+    active_clone = ctx.engine.clone_for_agent()
+    active_clone.on_session_start(
+        "foreground-session",
+        platform="discord",
+        conversation_id="agent:main:discord:dm:42",
+    )
+    active_clone.on_session_start(
+        "side-channel",
+        platform="cron",
+        conversation_id="agent:main:cron:tick:1",
+    )
+    assert active_clone.bound_session_id == "side-channel"
+    assert active_clone.current_session_id == "foreground-session"
+
+    clone_ingests = []
+    singleton_ingests = []
+    monkeypatch.setattr(active_clone, "ingest", lambda messages: clone_ingests.append(list(messages)))
+    monkeypatch.setattr(ctx.engine, "ingest", lambda messages: singleton_ingests.append(list(messages)))
+    history = [{"role": "user", "content": "foreground turn"}]
+
+    manager._hooks["post_llm_call"][-1](
+        session_id="foreground-session",
+        conversation_id="agent:main:discord:dm:42",
+        platform="discord",
+        conversation_history=history,
+    )
+
+    assert active_clone.bound_session_id == "side-channel"
+    assert clone_ingests == []
+    assert singleton_ingests == [history]
+    active_clone.shutdown()
+    ctx.engine.shutdown()
+
+
 def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, tmp_path):
     for lookup_mode in ("session", "conversation", "mismatched_conversation"):
         module = _load_plugin_entrypoint_module(f"hermes_lcm_post_hook_stale_{lookup_mode}")

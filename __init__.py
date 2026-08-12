@@ -340,6 +340,7 @@ def _command_engine_for_current_session(engine, resolve_active_lcm_engine):
         active_engine = resolve_active_lcm_engine(
             session_id=session_id,
             conversation_id=conversation_id,
+            allow_foreground=True,
         )
         if active_engine is not None:
             return active_engine

@@ -93,7 +93,12 @@ def _remove_registry_entries_for_engine(
             _ACTIVE_ENGINES_BY_CONVERSATION_ID.pop(registered_conversation_id, None)
 
 
-def resolve_active_lcm_engine(session_id: str = "", conversation_id: str = "") -> Any:
+def resolve_active_lcm_engine(
+    session_id: str = "",
+    conversation_id: str = "",
+    *,
+    allow_foreground: bool = False,
+) -> Any:
     """Return the LCM runtime clone most recently bound to a session/lane.
 
     Newer Hermes Agent hosts pass the active per-agent context engine directly
@@ -125,11 +130,12 @@ def resolve_active_lcm_engine(session_id: str = "", conversation_id: str = "") -
                 return engine
             if engine is not None and not conversation_matches:
                 _ACTIVE_ENGINES_BY_CONVERSATION_ID.pop(conversation_id, None)
-        # Direct lookups above follow the engine's actively-bound ingest lane.
-        # If that lane is a side channel, find the same engine by its stable
-        # operator-facing foreground view. Registry size is bounded by live
-        # AIAgent clones and values are weak, so this scan does not retain stale
-        # runtimes or grow with historical sessions.
+        if not allow_foreground:
+            return None
+        # Operator commands may target the stable foreground view while a side
+        # channel owns the bound ingest lane. Lifecycle callers must not take
+        # this fallback or they can rebind the side-channel clone mid-turn.
+        # Registry size is bounded by live AIAgent clones and values are weak.
         seen: set[int] = set()
         for engine in (
             list(_ACTIVE_ENGINES_BY_SESSION_ID.values())
