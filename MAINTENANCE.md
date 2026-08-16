@@ -35,6 +35,7 @@ into Hermes is a separate promotion step.
 - **Upstream tracking:** Fork-only policy divergence; no upstream issue or PR
   created. Check upstream source and release notes before each synchronization.
 - **Upstream PR:** `None after checked 2026-08-16`.
+
 - **Regression:**
   `python -m pytest tests/test_recall_guidance.py -q`; additionally verify the
   loaded policy contains no `lcm_recall` or cross-conversation routing sentence.
@@ -44,6 +45,20 @@ into Hermes is a separate promotion step.
 - **Retirement:** Retire only after released upstream provides an equivalent
   policy boundary that prevents ordinary model routing through cross-session
   LCM recall, or after Brian explicitly chooses to restore that route.
+
+### LCM-002 — Preserve safe compaction deferrals across the host boundary
+
+- **Status:** Active; upstream contribution pending.
+- **Stable commit subject:** `fix(compaction): expose safe no-progress deferrals`
+- **Summary:** Reports threshold-triggered no-progress decisions as `deferred` rather than the ambiguous `noop` status, while retaining `noop` for ordinary below-threshold cleanup/pass-through cases. The public no-op predicate continues to recognize both statuses.
+- **Surfaces:**
+  `compaction.py`, `engine.py`, `tests/test_lcm_engine.py`
+- **Upstream tracking:** Related to hermes-lcm#168 and hermes-lcm#188; verify current upstream state before publication.
+- **Upstream PR:** Pending creation after the maintained commit is pushed.
+- **Regression:**
+  `pytest tests/test_lcm_engine.py -q`; specifically verifies threshold pressure with only protected/insufficient backlog returns unchanged messages, `deferred` status, and no false compaction request.
+- **Rollback:** Revert the focused commit and rerun `pytest tests/test_lcm_engine.py -q`; Hermes host compatibility remains backward-compatible because `last_compression_was_noop` accepts both `noop` and `deferred`.
+- **Retirement:** Retire when released upstream exposes an equivalent safe-deferral status and the Hermes host no longer needs the fork-specific behavior.
 
 ## Synchronization procedure
 
