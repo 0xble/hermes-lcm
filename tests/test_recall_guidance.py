@@ -34,7 +34,14 @@ def test_recall_policy_is_canonical_bounded_and_benchmark_neutral():
     assert 0 < len(first.encode("utf-8")) <= 8 * 1024
     assert hashlib.sha256(first.encode("utf-8")).hexdigest() == guidance.recall_policy_sha256()
     lowered = first.lower()
-    for forbidden in ("longmemeval", "question_id", "reference answer", "judge output"):
+    for forbidden in (
+        "longmemeval",
+        "question_id",
+        "reference answer",
+        "judge output",
+        "lcm_recall",
+        "cross-conversation memory",
+    ):
         assert forbidden not in lowered
 
 
@@ -49,8 +56,6 @@ def test_recall_policy_covers_evidence_safety_and_stable_tool_routing():
         "lcm_grep",
         "lcm_describe",
         "lcm_expand_query",
-        "lcm_recall",
-        "lcm_load_session",
         "lcm_recent",
         "lcm_compile_evidence",
         "lcm_evidence_pack",
