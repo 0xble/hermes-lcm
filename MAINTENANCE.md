@@ -54,7 +54,7 @@ into Hermes is a separate promotion step.
 - **Surfaces:**
   `compaction.py`, `engine.py`, `tests/test_lcm_engine.py`
 - **Upstream tracking:** Related to hermes-lcm#168 and hermes-lcm#188; verify current upstream state before publication.
-- **Upstream PR:** Pending creation after the maintained commit is pushed.
+- **Upstream PR:** `https://github.com/stephenschoettler/hermes-lcm/pull/531` (open; head `0xble:fix/safe-compaction-deferral`, commit `67e97dfb9c50dae4ff91291ea350cc746d6a642b`).
 - **Regression:**
   `pytest tests/test_lcm_engine.py -q`; specifically verifies threshold pressure with only protected/insufficient backlog returns unchanged messages, `deferred` status, and no false compaction request.
 - **Rollback:** Revert the focused commit and rerun `pytest tests/test_lcm_engine.py -q`; Hermes host compatibility remains backward-compatible because `last_compression_was_noop` accepts both `noop` and `deferred`.
