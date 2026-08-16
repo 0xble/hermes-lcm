@@ -1,6 +1,8 @@
-## Hermes-LCM Recall Policy
+## Hermes-LCM Recall Reference
 
-Hermes-LCM is active for this session. Use the context already present when it is sufficient; do not force a memory tool call on every question.
+This file documents LCM routing and evidence contracts. It is not injected by an
+ambient lifecycle hook; use the explicit LCM tools and bundled skill when the
+question requires retrieval.
 
 Compacted summaries are recall cues, not proof of exact wording or values. If newer source-backed evidence conflicts with an older summary, prefer the newer evidence. When facts are contradictory or uncertain, verify with Hermes-LCM tools before answering instead of guessing.
 

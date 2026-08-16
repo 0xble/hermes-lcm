@@ -389,36 +389,10 @@ def register(ctx):
                 exc,
             )
 
-        # Hermes invokes this hook after the context engine has received
-        # on_session_start(). Resolve through LCM's own registry so merely
-        # loading the plugin cannot inject guidance when another context
-        # engine is serving the turn. Capture one validated policy value for
-        # deterministic, byte-stable injection across eligible turns.
-        try:
-            recall_policy = get_recall_policy()
-
-            def _on_pre_llm_call(**payload):
-                session_id = str(payload.get("session_id") or "")
-                conversation_id = str(
-                    payload.get("conversation_id")
-                    or payload.get("gateway_session_key")
-                    or ""
-                )
-                active_engine = resolve_active_lcm_engine(
-                    session_id=session_id,
-                    conversation_id=conversation_id,
-                )
-                if active_engine is None or getattr(active_engine, "name", None) != "lcm":
-                    return None
-                return _pre_llm_context(active_engine, recall_policy, payload)
-
-            register_hook("pre_llm_call", _on_pre_llm_call)
-        except Exception as exc:
-            logger.warning(
-                "LCM recall-policy hook registration did not complete; "
-                "tool schemas remain available: %s",
-                exc,
-            )
+    # LCM-specific routing is exposed through context-engine schemas and the
+    # bundled skill. It is deliberately not an ambient pre_llm_call prompt:
+    # request context must not be presented as user-authored content or persist
+    # through the provider replay sidecar.
 
     # Register tools via the plugin registry only on hosts that preserve the
     # active messages=... contract for registered context-engine tools.

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import types
 
+import pytest
 
 EXPECTED_LCM_TOOLS = {
     "lcm_grep",
@@ -504,7 +505,7 @@ def test_register_gracefully_degrades_when_host_lacks_register_tool():
     assert ctx.engine.name == "lcm"
 
 
-def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(tmp_path, monkeypatch):
+def test_plugin_entrypoint_registers_bundled_skill_without_ambient_recall_policy(tmp_path, monkeypatch):
     module = _load_plugin_entrypoint_module("hermes_lcm_packaging_skill_and_policy")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
     registered_skills = []
@@ -532,22 +533,11 @@ def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(
     assert path == Path(module.__file__).resolve().parent / "skills" / "hermes-lcm"
     assert (path / "SKILL.md").is_file()
     assert "recall" in description.lower()
-    assert len(hooks["pre_llm_call"]) == 1
-
-    policy_hook = hooks["pre_llm_call"][0]
-    assert policy_hook(session_id="not-bound") is None
-
-    ctx.engine.on_session_start("active-session", platform="cli")
-    first = policy_hook(session_id="active-session")
-    second = policy_hook(session_id="active-session")
-    assert first == second
-    assert first == {"context": module.get_recall_policy()}
-    assert "Hermes-LCM Recall Policy" in first["context"]
-    assert "lcm_recall" in first["context"]
-    assert "lcm_expand_query" in first["context"]
+    assert "pre_llm_call" not in hooks
     ctx.engine.shutdown()
 
 
+@pytest.mark.skip(reason="ambient pre_llm_call hook removed; mechanics are covered by direct evidence tests")
 def test_pre_llm_hook_disabled_toolset_is_identical_and_routed_adds_exact_session_evidence(
     tmp_path, monkeypatch
 ):
@@ -623,6 +613,7 @@ def test_pre_llm_hook_disabled_toolset_is_identical_and_routed_adds_exact_sessio
     ctx.engine.shutdown()
 
 
+@pytest.mark.skip(reason="ambient pre_llm_call hook removed; mechanics are covered by direct evidence tests")
 def test_pre_llm_hook_ordinary_path_makes_no_recall_or_selector_call(
     tmp_path, monkeypatch
 ):
@@ -665,6 +656,7 @@ def test_pre_llm_hook_ordinary_path_makes_no_recall_or_selector_call(
     ctx.engine.shutdown()
 
 
+@pytest.mark.skip(reason="ambient pre_llm_call hook removed; mechanics are covered by direct evidence tests")
 def test_pre_llm_hook_routed_path_creates_one_answer_ready_baseline(tmp_path, monkeypatch):
     module = _load_plugin_entrypoint_module("hermes_lcm_packaging_selective_baseline")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
@@ -725,6 +717,7 @@ def test_pre_llm_hook_routed_path_creates_one_answer_ready_baseline(tmp_path, mo
     ctx.engine.shutdown()
 
 
+@pytest.mark.skip(reason="ambient pre_llm_call hook removed; mechanics are covered by direct evidence tests")
 def test_pre_llm_hook_selective_compiler_uses_existing_auxiliary_seam_and_fails_open(
     tmp_path, monkeypatch
 ):
@@ -830,6 +823,7 @@ def test_pre_llm_hook_selective_compiler_uses_existing_auxiliary_seam_and_fails_
     ctx.engine.shutdown()
 
 
+@pytest.mark.skip(reason="ambient pre_llm_call hook removed; mechanics are covered by direct evidence tests")
 def test_pre_llm_hook_requirements_mode_uses_compiler_without_selector(
     tmp_path, monkeypatch
 ):
@@ -902,6 +896,7 @@ def test_pre_llm_hook_requirements_mode_uses_compiler_without_selector(
     ctx.engine.shutdown()
 
 
+@pytest.mark.skip(reason="ambient pre_llm_call hook removed; mechanics are covered by direct evidence tests")
 def test_pre_llm_hook_renders_internally_recalled_answer_sufficient_fact(
     tmp_path, monkeypatch
 ):
@@ -963,6 +958,7 @@ def test_pre_llm_hook_renders_internally_recalled_answer_sufficient_fact(
     ctx.engine.shutdown()
 
 
+@pytest.mark.skip(reason="ambient pre_llm_call hook removed; mechanics are covered by direct evidence tests")
 def test_pre_llm_hook_requirements_ordinary_and_disabled_toolset_are_byte_identical(
     tmp_path, monkeypatch
 ):
