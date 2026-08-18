@@ -62,9 +62,9 @@ into Hermes is a separate promotion step.
 
 ### LCM-003 — Gate opportunistic maintenance on token pressure
 
-- **Status:** Active candidate; not promoted.
+- **Status:** Active; promoted to the Personal runtime from exact commit `bd17a915ae7d2777257c42d4ddec324af8616d20` on 2026-08-18 with `LCM_MAINTENANCE_MIN_PRESSURE_RATIO=1.0`.
 - **Stable commit subject:** `fix(compaction): gate unnecessary replay maintenance`
-- **Summary:** Adds an opt-in pressure floor for the divergent-replay leaf and ignored-backlog maintenance arms. The default remains `0.0`; Personal promotion is intended to set `LCM_MAINTENANCE_MIN_PRESSURE_RATIO=1.0` only after separate approval. Overflow recovery and deterministic cleanup remain outside this gate.
+- **Summary:** Adds an opt-in pressure floor for the divergent-replay leaf and ignored-backlog maintenance arms. The source default remains `0.0`; the Personal runtime sets `LCM_MAINTENANCE_MIN_PRESSURE_RATIO=1.0`. Overflow recovery and deterministic cleanup remain outside this gate.
 - **Surfaces:** `compaction.py`, `config.py`, `tools.py`, `README.md`, `docs/operator-guide.md`, `tests/test_maintenance_pressure_floor.py`.
 - **Upstream tracking:** Direct port of hermes-lcm PR #516, commit `034d52ac8a7ebbbb17cd0ab368cec101c0255bae`; open and unshipped when checked 2026-08-18.
 - **Upstream PR:** `https://github.com/stephenschoettler/hermes-lcm/pull/516`.
@@ -74,7 +74,7 @@ into Hermes is a separate promotion step.
 
 ### LCM-004 — Require optional replay cleanup to reduce active context
 
-- **Status:** Active candidate; not promoted.
+- **Status:** Active; promoted to the Personal runtime from exact commit `bd17a915ae7d2777257c42d4ddec324af8616d20` on 2026-08-18.
 - **Stable commit subject:** `fix(compaction): gate unnecessary replay maintenance`
 - **Summary:** Classifies only externalization-only replay differences as optional. Automatic optional cleanup is admitted and returned only when it strictly reduces active-context tokens; otherwise LCM reports a benign `deferred` result before Hermes must reject it. Manual compression, overflow recovery, sensitive redaction, quarantine, ignored-message cleanup, mixed-length reconciliation, and Hermes's final anti-growth guard remain unchanged.
 - **Surfaces:** `compaction.py`, `tests/test_optional_cleanup_admission.py`, and shrinking-fixture updates in `tests/test_lcm_engine.py` and `tests/test_active_tool_stubbing.py`.
