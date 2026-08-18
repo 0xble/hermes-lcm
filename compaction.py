@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .ingest_protection import redact_sensitive_value
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -65,6 +66,24 @@ class CompactionMixin:
         if self.threshold_tokens <= 0:
             return False
         return tokens >= self.threshold_tokens
+
+    def _maintenance_pressure_met(self, observed_tokens: int) -> bool:
+        """Return whether opportunistic maintenance may run at this pressure."""
+        ratio = self._config.maintenance_min_pressure_ratio or 0.0
+        if ratio <= 0.0 or self.threshold_tokens <= 0:
+            return True
+        floor = int(self.threshold_tokens * ratio)
+        if observed_tokens >= floor:
+            return True
+        logger.debug(
+            "LCM maintenance compaction deferred: %d tokens < %d floor "
+            "(%.0f%% of %d threshold)",
+            observed_tokens,
+            floor,
+            ratio * 100,
+            self.threshold_tokens,
+        )
+        return False
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
@@ -129,6 +148,20 @@ class CompactionMixin:
                 messages=replay_messages,
             )
             if cleanup_requested:
+                optional_cleanup_only = self._replay_diff_is_optional_cleanup_only(
+                    messages,
+                    replay_messages,
+                )
+                if (
+                    optional_cleanup_only
+                    and not force_overflow_requested
+                    and self._optional_cleanup_would_not_reduce(
+                        messages,
+                        replay_messages,
+                    )
+                ):
+                    self._record_optional_cleanup_deferral()
+                    return False
                 if (
                     not force_overflow_requested
                     and self._compression_boundary_cooldown_active()
@@ -157,9 +190,11 @@ class CompactionMixin:
                     and replay_rough >= self.threshold_tokens
                 ),
             )
-            if eligible:
+            if eligible and self._maintenance_pressure_met(replay_rough):
                 return self._mark_preflight_compression_requested()
-            if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
+            if self._has_ignored_backlog_outside_fresh_tail(
+                replay_messages
+            ) and self._maintenance_pressure_met(replay_rough):
                 return self._mark_preflight_compression_requested()
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
@@ -233,6 +268,74 @@ class CompactionMixin:
             ):
                 return True
         return False
+
+    def _replay_diff_is_optional_cleanup_only(
+        self,
+        original_messages: List[Dict[str, Any]],
+        replay_messages: List[Dict[str, Any]],
+    ) -> bool:
+        """Return whether every replay change is optional externalization."""
+        if len(original_messages) != len(replay_messages):
+            return False
+        for original_msg in original_messages:
+            original_content = original_msg.get("content")
+            if redact_sensitive_value(
+                original_content,
+                self._config,
+                parse_json_strings=False,
+            ) != original_content:
+                return False
+            original_tool_calls = original_msg.get("tool_calls")
+            if redact_sensitive_value(
+                original_tool_calls,
+                self._config,
+                parse_json_strings=True,
+            ) != original_tool_calls:
+                return False
+        optional_prefixes = (
+            "[Externalized LCM ingest payload:",
+            "[Externalized payload: kind=raw_payload;",
+            "[Externalized tool output:",
+        )
+        changed = False
+        for original_msg, replay_msg in zip(original_messages, replay_messages):
+            if original_msg == replay_msg:
+                continue
+            if original_msg.get("role") != replay_msg.get("role"):
+                return False
+            if original_msg.get("tool_calls") != replay_msg.get("tool_calls"):
+                return False
+            original_text = text_content_for_pattern_matching(
+                original_msg.get("content")
+            ) or ""
+            replay_text = text_content_for_pattern_matching(
+                replay_msg.get("content")
+            ) or ""
+            if original_text == replay_text or not replay_text.startswith(
+                optional_prefixes
+            ):
+                return False
+            changed = True
+        return changed
+
+    def _optional_cleanup_would_not_reduce(
+        self,
+        original_messages: List[Dict[str, Any]],
+        candidate_messages: List[Dict[str, Any]],
+    ) -> bool:
+        return count_messages_tokens(candidate_messages) >= count_messages_tokens(
+            original_messages
+        )
+
+    def _record_optional_cleanup_deferral(self) -> None:
+        self._last_compression_status = "deferred"
+        self._last_compression_noop_reason = (
+            "optional replay cleanup would not reduce active context"
+        )
+        logger.info(
+            "LCM preflight compression deferred: %s",
+            self._last_compression_noop_reason,
+        )
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
         if not self._compiled_ignore_message_patterns or not messages:
@@ -428,6 +531,22 @@ class CompactionMixin:
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        optional_cleanup_only = self._replay_diff_is_optional_cleanup_only(
+            messages,
+            working_messages,
+        )
+        if (
+            optional_cleanup_only
+            and not force
+            and not force_overflow
+            and self._optional_cleanup_would_not_reduce(
+                messages,
+                working_messages,
+            )
+        ):
+            self._ingest_cursor = len(messages)
+            self._record_optional_cleanup_deferral()
+            return messages
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown
             and not force_overflow
@@ -438,6 +557,17 @@ class CompactionMixin:
                 working_messages,
                 insert_missing_tool_stubs=False,
             )
+            if (
+                optional_cleanup_only
+                and not force
+                and self._optional_cleanup_would_not_reduce(
+                    messages,
+                    sanitized_messages,
+                )
+            ):
+                self._ingest_cursor = len(messages)
+                self._record_optional_cleanup_deferral()
+                return messages
             self._refresh_raw_backlog_debt(
                 sanitized_messages,
                 observed_tokens=observed_prompt_tokens,
@@ -887,6 +1017,18 @@ class CompactionMixin:
                     active_context_messages,
                     insert_missing_tool_stubs=False,
                 )
+            if (
+                optional_cleanup_only
+                and not force
+                and not force_overflow
+                and self._optional_cleanup_would_not_reduce(
+                    messages,
+                    sanitized_messages,
+                )
+            ):
+                self._ingest_cursor = len(messages)
+                self._record_optional_cleanup_deferral()
+                return messages
             if sanitized_messages != working_messages or ingest_cleanup_changed_active_context:
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from a sanitized

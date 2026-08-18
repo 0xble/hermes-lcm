@@ -7762,7 +7762,7 @@ class TestMessageFiltering:
         try:
             first.on_session_start("session", platform="telegram", context_length=1000)
             active = first.compress(
-                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}],
+                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 2000}],
                 current_tokens=10_000,
             )
             active_stub = {"role": "user", "content": active[0]["content"]}
@@ -7809,7 +7809,7 @@ class TestMessageFiltering:
         try:
             first.on_session_start("session", platform="telegram", context_length=1000)
             active = first.compress(
-                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}],
+                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 2000}],
                 current_tokens=10_000,
             )
             active_stub = {"role": "user", "content": active[0]["content"]}
@@ -8831,7 +8831,7 @@ class TestMessageFiltering:
             second.on_session_start("session", platform="telegram", context_length=1000)
             messages = [
                 {"role": "user", "content": placeholder},
-                {"role": "user", "content": "oversized raw payload " + "x" * 200},
+                {"role": "user", "content": "oversized raw payload " + "x" * 2000},
             ]
 
             assert second.should_compress_preflight(messages) is True

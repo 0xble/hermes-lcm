@@ -71,7 +71,7 @@ def assembled_tool(result, call_id):
 
 
 def externalized_raw_cleanup_messages():
-    original = [{"role": "user", "content": "large raw payload"}]
+    original = [{"role": "user", "content": "large raw payload " + "x" * 2000}]
     cleanup = [
         {
             "role": "user",

@@ -60,6 +60,30 @@ into Hermes is a separate promotion step.
 - **Rollback:** Revert the focused commit and rerun `pytest tests/test_lcm_engine.py -q`; Hermes host compatibility remains backward-compatible because `last_compression_was_noop` accepts both `noop` and `deferred`.
 - **Retirement:** Retire when released upstream exposes an equivalent safe-deferral status and the Hermes host no longer needs the fork-specific behavior.
 
+### LCM-003 — Gate opportunistic maintenance on token pressure
+
+- **Status:** Active candidate; not promoted.
+- **Stable commit subject:** `fix(compaction): gate unnecessary replay maintenance`
+- **Summary:** Adds an opt-in pressure floor for the divergent-replay leaf and ignored-backlog maintenance arms. The default remains `0.0`; Personal promotion is intended to set `LCM_MAINTENANCE_MIN_PRESSURE_RATIO=1.0` only after separate approval. Overflow recovery and deterministic cleanup remain outside this gate.
+- **Surfaces:** `compaction.py`, `config.py`, `tools.py`, `README.md`, `docs/operator-guide.md`, `tests/test_maintenance_pressure_floor.py`.
+- **Upstream tracking:** Direct port of hermes-lcm PR #516, commit `034d52ac8a7ebbbb17cd0ab368cec101c0255bae`; open and unshipped when checked 2026-08-18.
+- **Upstream PR:** `https://github.com/stephenschoettler/hermes-lcm/pull/516`.
+- **Regression:** `python -m pytest tests/test_maintenance_pressure_floor.py -q` verifies the disabled default, environment loading, boundary semantics, and both divergent opportunistic arms.
+- **Rollback:** Clear the runtime pressure-ratio setting, revert this focused commit, and rerun the focused regression. Do not change the normal context threshold.
+- **Retirement:** Retire when a released upstream version provides an equivalent pressure floor with default-preserving behavior and both opportunistic arms covered.
+
+### LCM-004 — Require optional replay cleanup to reduce active context
+
+- **Status:** Active candidate; not promoted.
+- **Stable commit subject:** `fix(compaction): gate unnecessary replay maintenance`
+- **Summary:** Classifies only externalization-only replay differences as optional. Automatic optional cleanup is admitted and returned only when it strictly reduces active-context tokens; otherwise LCM reports a benign `deferred` result before Hermes must reject it. Manual compression, overflow recovery, sensitive redaction, quarantine, ignored-message cleanup, mixed-length reconciliation, and Hermes's final anti-growth guard remain unchanged.
+- **Surfaces:** `compaction.py`, `tests/test_optional_cleanup_admission.py`, and shrinking-fixture updates in `tests/test_lcm_engine.py` and `tests/test_active_tool_stubbing.py`.
+- **Upstream tracking:** No upstream implementation or tracker enforces this host/plugin monotonic cleanup contract after repository-wide check on 2026-08-18. Related symptom reports: hermes-lcm issues #513 and #532.
+- **Upstream PR:** `None after checked 2026-08-18`.
+- **Regression:** `python -m pytest tests/test_optional_cleanup_admission.py -q` verifies the observed 55,812-to-55,961-token refusal, equal-size deferral, shrinking cleanup admission, mandatory and mixed sensitive/externalization cleanup, manual compression, overflow recovery, durability, and no summarizer call even with eligible backlog. Existing externalization/filtering fixtures use payloads that are actually smaller after cleanup.
+- **Rollback:** Revert this focused commit and rerun the focused regression. Keep Hermes's host anti-growth guard intact.
+- **Retirement:** Retire when released upstream distinguishes optional from mandatory replay cleanup and proves automatic optional candidates strictly shrink before host adoption.
+
 ## Synchronization procedure
 
 1. Inspect `git status`, current `HEAD`, `origin`, and `upstream` before work.

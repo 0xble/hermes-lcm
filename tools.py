@@ -6487,6 +6487,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "deferred_maintenance_enabled": engine._config.deferred_maintenance_enabled,
             "deferred_maintenance_max_passes": engine._config.deferred_maintenance_max_passes,
             "critical_budget_pressure_ratio": engine._config.critical_budget_pressure_ratio,
+            "maintenance_min_pressure_ratio": engine._config.maintenance_min_pressure_ratio,
             "threshold_full_sweep_enabled": engine._config.threshold_full_sweep_enabled,
             "summary_prefix_target_tokens": engine._config.summary_prefix_target_tokens,
             "threshold_full_sweep_max_passes": 12,
