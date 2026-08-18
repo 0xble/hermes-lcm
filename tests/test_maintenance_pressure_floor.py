@@ -74,6 +74,27 @@ def test_divergent_replay_leaf_maintenance_respects_pressure_floor(tmp_path, mon
     assert engine.should_compress_preflight(messages) is False
 
 
+def test_divergent_replay_leaf_maintenance_runs_at_configured_floor(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, maintenance_min_pressure_ratio=1.0)
+    engine.threshold_tokens = 100
+    messages = [{"role": "user", "content": "original"}]
+    replay = [{"role": "user", "content": "rewritten"}]
+
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: replay)
+    monkeypatch.setattr(engine, "_replay_diff_requests_ingest_cleanup", lambda *_args: False)
+    monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        engine,
+        "_leaf_compaction_candidate_status",
+        lambda *_args, **_kwargs: (True, "eligible raw backlog outside fresh tail"),
+    )
+    monkeypatch.setattr(engine, "_has_ignored_backlog_outside_fresh_tail", lambda _messages: False)
+    monkeypatch.setattr(engine, "_should_run_deferred_maintenance", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("hermes_lcm.compaction.count_messages_tokens", lambda _value: 100)
+
+    assert engine.should_compress_preflight(messages) is True
+
+
 def test_divergent_replay_ignored_backlog_respects_pressure_floor(tmp_path, monkeypatch):
     engine = _engine(tmp_path, maintenance_min_pressure_ratio=0.5)
     engine.threshold_tokens = 100
