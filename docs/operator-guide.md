@@ -193,7 +193,7 @@ environment variables:
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
-| `LCM_MAINTENANCE_MIN_PRESSURE_RATIO` | `0.0` | Minimum fraction of the normal compaction threshold required for opportunistic divergent-replay maintenance; `0.0` preserves historical behavior |
+| `LCM_MAINTENANCE_MIN_PRESSURE_RATIO` | `0.0` | Minimum fraction of the normal compaction threshold required for automatic model-backed maintenance. The host-supplied prompt estimate is authoritative at `compress()` admission; deterministic cleanup can still be adopted below the floor. `0.0` preserves historical behavior. |
 | `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |

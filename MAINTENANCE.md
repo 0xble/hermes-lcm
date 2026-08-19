@@ -84,6 +84,17 @@ into Hermes is a separate promotion step.
 - **Rollback:** Revert this focused commit and rerun the focused regression. Keep Hermes's host anti-growth guard intact.
 - **Retirement:** Retire when released upstream distinguishes optional from mandatory replay cleanup and proves automatic optional candidates strictly shrink before host adoption.
 
+### LCM-005 — Enforce host pressure at model-spend admission
+
+- **Status:** Active in fork source; not promoted to a managed runtime.
+- **Stable commit subject:** `fix(compaction): enforce host maintenance pressure`
+- **Summary:** Carries a one-shot preflight intent into `compress()`. Below the configured maintenance floor, the host-supplied prompt estimate blocks automatic summarization, extraction, condensation, and DAG publication even when LCM's internal replay estimate is larger. Cleanup-triggered passes may adopt deterministic sanitized replay only. Manual `force=True`, overflow recovery, direct unmarked compression, and the default `0.0` behavior remain unchanged.
+- **Surfaces:** `compaction.py`, `engine.py`, `reset_state.py`, `tests/test_maintenance_pressure_floor.py`, `tests/test_optional_cleanup_admission.py`, `README.md`, and `docs/operator-guide.md`.
+- **Upstream tracking:** Extends the policy direction of open hermes-lcm issue #496 and PR #516. PR #516 gates internal LCM estimates but does not enforce the host-observed spend boundary at `compress()`.
+- **Regression:** `python -m pytest tests/test_maintenance_pressure_floor.py tests/test_optional_cleanup_admission.py -q` covers production-shaped host/LCM estimator disagreement, cleanup-only adoption, maintenance deferral, and one-shot intent consumption.
+- **Rollback:** Revert this focused commit. Clearing `LCM_MAINTENANCE_MIN_PRESSURE_RATIO` restores the source-default behavior without changing the normal context threshold.
+- **Retirement:** Retire when a released upstream version carries automatic preflight intent to model-spend admission and proves host-subthreshold passes cannot invoke model-backed compaction.
+
 ## Synchronization procedure
 
 1. Inspect `git status`, current `HEAD`, `origin`, and `upstream` before work.

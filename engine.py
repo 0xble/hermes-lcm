@@ -559,6 +559,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # One-shot handoff from preflight: adopt an already-durable replay
         # cleanup during boundary cooldown without running summary work.
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        # One-shot handoff identifying why automatic preflight requested a pass.
+        # compress() consumes this before deciding whether host-observed pressure
+        # admits model-backed work or cleanup-only adoption.
+        self._preflight_intent: Optional[str] = None
+        self._preflight_session_id: Optional[str] = None
+        self._preflight_message_list_id: Optional[int] = None
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
@@ -999,8 +1005,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status in {"noop", "deferred"}
 
-    def _mark_preflight_compression_requested(self) -> bool:
+    def _mark_preflight_compression_requested(self, intent: str = "maintenance") -> bool:
         """Record that preflight found work and clear any stale no-op reason."""
+        self._preflight_intent = intent
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
         return True

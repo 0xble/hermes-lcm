@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.tokens import count_messages_tokens
@@ -196,6 +198,81 @@ def test_compress_adopts_shrinking_optional_cleanup_without_summarizer(tmp_path,
     summary_spy.assert_not_called()
 
 
+def test_subthreshold_preflight_cleanup_cannot_admit_leaf_summary(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    engine._config.maintenance_min_pressure_ratio = 1.0
+    engine.threshold_tokens = 260_399
+    engine._config.fresh_tail_count = 1
+    engine._config.leaf_chunk_tokens = 1
+    messages = [
+        {"role": "user", "content": "eligible old backlog"},
+        {"role": "assistant", "content": "eligible old response"},
+        {"role": "user", "content": "fresh tail"},
+    ]
+    replay = [
+        {"role": "user", "content": _optional_stub("shrinking externalization")},
+        messages[1],
+        messages[2],
+    ]
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: replay)
+    monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        engine,
+        "_sanitize_active_context_messages",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        "hermes_lcm.compaction.count_messages_tokens",
+        lambda value: 253_003 if value is replay else 1_490_598,
+    )
+    summary_spy = Mock(side_effect=AssertionError("subthreshold cleanup must not summarize"))
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summary_spy)
+
+    assert engine.should_compress_preflight(messages) is True
+    assert engine.compress(messages, current_tokens=211_051) == replay
+    assert engine._last_compression_status == "sanitized"
+    assert engine.compression_count == 0
+    assert engine._dag.get_session_nodes(engine.current_session_id) == []
+    summary_spy.assert_not_called()
+
+
+def test_manual_force_overrides_cleanup_only_boundary_handoff(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    engine._config.maintenance_min_pressure_ratio = 1.0
+    engine.threshold_tokens = 100
+    engine._config.fresh_tail_count = 1
+    engine._config.leaf_chunk_tokens = 1
+    messages = [
+        {"role": "user", "content": "eligible old backlog"},
+        {"role": "assistant", "content": "eligible old response"},
+        {"role": "user", "content": "fresh tail"},
+    ]
+    replay = [
+        {"role": "user", "content": _optional_stub("shrinking externalization")},
+        messages[1],
+        messages[2],
+    ]
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: replay)
+    monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
+    monkeypatch.setattr(engine, "_compression_boundary_cooldown_active", lambda: True)
+    monkeypatch.setattr(
+        "hermes_lcm.compaction.count_messages_tokens",
+        lambda value: 50 if value is replay else 150,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_summarize_leaf_chunk_with_rescue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("manual force reached summarizer")
+        ),
+    )
+
+    assert engine.should_compress_preflight(messages) is True
+    assert engine._preflight_cleanup_only_due_to_boundary_cooldown is True
+    with pytest.raises(AssertionError, match="manual force reached summarizer"):
+        engine.compress(messages, current_tokens=20, force=True)
+
+
 def test_nonshrinking_optional_cleanup_defers_at_threshold_without_summary(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     engine.threshold_tokens = 10
@@ -240,6 +317,44 @@ def test_preflight_preserves_mandatory_sensitive_cleanup_even_when_larger(tmp_pa
     _prepare_preflight(engine, monkeypatch, replay, original_tokens=10, replay_tokens=11)
 
     assert engine.should_compress_preflight(messages) is True
+
+
+def test_subthreshold_mandatory_cleanup_stays_model_free(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    engine._config.maintenance_min_pressure_ratio = 1.0
+    engine.threshold_tokens = 100
+    engine._config.fresh_tail_count = 1
+    engine._config.leaf_chunk_tokens = 1
+    messages = [
+        {"role": "tool", "content": "secret", "tool_call_id": "call-1"},
+        {"role": "assistant", "content": "eligible old response"},
+        {"role": "user", "content": "fresh tail"},
+    ]
+    replay = [
+        {
+            "role": "tool",
+            "content": "[LCM sensitive redaction: value removed by policy]",
+            "tool_call_id": "call-1",
+        },
+        messages[1],
+        messages[2],
+    ]
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: replay)
+    monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        engine,
+        "_sanitize_active_context_messages",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr("hermes_lcm.compaction.count_messages_tokens", lambda _value: 150)
+    summary_spy = Mock(side_effect=AssertionError("mandatory cleanup must not summarize"))
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summary_spy)
+
+    assert engine.should_compress_preflight(messages) is True
+    assert engine.compress(messages, current_tokens=20) == replay
+    assert engine._last_compression_status == "sanitized"
+    assert engine.compression_count == 0
+    summary_spy.assert_not_called()
 
 
 def test_sensitive_externalization_cleanup_is_not_treated_as_optional(tmp_path, monkeypatch):

@@ -88,6 +88,9 @@ class CompactionMixin:
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        self._preflight_intent = None
+        self._preflight_session_id = self._session_id
+        self._preflight_message_list_id = id(messages)
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
@@ -167,7 +170,7 @@ class CompactionMixin:
                     and self._compression_boundary_cooldown_active()
                 ):
                     self._preflight_cleanup_only_due_to_boundary_cooldown = True
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(intent="cleanup")
             if force_overflow_requested:
                 return self._mark_preflight_compression_requested()
             # A boundary skip cools down summary-producing leaf/condensation
@@ -479,6 +482,19 @@ class CompactionMixin:
         4. Check if condensation is needed
         5. Assemble new active context: summaries + fresh tail
         """
+        preflight_identity_matches = bool(
+            self._preflight_session_id == self._session_id
+            and self._preflight_message_list_id == id(messages)
+        )
+        preflight_intent = self._preflight_intent if preflight_identity_matches else None
+        preflight_cleanup_only_due_to_boundary_cooldown = bool(
+            preflight_identity_matches
+            and self._preflight_cleanup_only_due_to_boundary_cooldown
+        )
+        self._preflight_intent = None
+        self._preflight_session_id = None
+        self._preflight_message_list_id = None
+        self._preflight_cleanup_only_due_to_boundary_cooldown = False
         if not messages:
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = "empty message list"
@@ -548,11 +564,23 @@ class CompactionMixin:
             self._record_optional_cleanup_deferral()
             return messages
         cleanup_only_due_to_boundary_cooldown = bool(
-            self._preflight_cleanup_only_due_to_boundary_cooldown
+            preflight_cleanup_only_due_to_boundary_cooldown
+            and not force
             and not force_overflow
         )
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
-        if cleanup_only_due_to_boundary_cooldown:
+        automatic_preflight_below_maintenance_pressure = bool(
+            preflight_intent is not None
+            and not force
+            and not force_overflow
+            and not self._maintenance_pressure_met(
+                observed_prompt_tokens if observed_prompt_tokens is not None else 0
+            )
+        )
+        cleanup_only_due_to_maintenance_pressure = bool(
+            automatic_preflight_below_maintenance_pressure
+            and preflight_intent == "cleanup"
+        )
+        if cleanup_only_due_to_boundary_cooldown or cleanup_only_due_to_maintenance_pressure:
             sanitized_messages = self._sanitize_active_context_messages(
                 working_messages,
                 insert_missing_tool_stubs=False,
@@ -586,6 +614,21 @@ class CompactionMixin:
                 )
             )
             return sanitized_messages
+        if automatic_preflight_below_maintenance_pressure:
+            self._refresh_raw_backlog_debt(
+                working_messages,
+                observed_tokens=observed_prompt_tokens,
+            )
+            self._ingest_cursor = len(working_messages)
+            self._last_compression_status = "deferred"
+            self._last_compression_noop_reason = (
+                "automatic maintenance below configured host pressure floor"
+            )
+            logger.info(
+                "LCM compression deferred: %s",
+                self._last_compression_noop_reason,
+            )
+            return messages
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
