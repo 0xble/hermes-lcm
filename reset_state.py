@@ -50,10 +50,6 @@ class ResetStateMixin:
         self._reset_compaction_progress()
         self._generated_ignored_active_replay_placeholder_hashes = set()
         self._generated_ignored_active_replay_placeholder_message_ids = set()
-        self._preflight_intent = None
-        self._preflight_session_id = None
-        self._preflight_message_list_id = None
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}

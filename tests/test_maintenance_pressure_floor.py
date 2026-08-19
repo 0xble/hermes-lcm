@@ -1,5 +1,6 @@
 """Opportunistic maintenance should require configured token pressure."""
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -74,7 +75,7 @@ def test_divergent_replay_leaf_maintenance_respects_pressure_floor(tmp_path, mon
     assert engine.should_compress_preflight(messages) is False
 
 
-def test_divergent_replay_leaf_maintenance_runs_at_configured_floor(tmp_path, monkeypatch):
+def test_divergent_replay_leaf_maintenance_never_runs_from_preflight(tmp_path, monkeypatch):
     engine = _engine(tmp_path, maintenance_min_pressure_ratio=1.0)
     engine.threshold_tokens = 100
     messages = [{"role": "user", "content": "original"}]
@@ -92,10 +93,47 @@ def test_divergent_replay_leaf_maintenance_runs_at_configured_floor(tmp_path, mo
     monkeypatch.setattr(engine, "_should_run_deferred_maintenance", lambda *_args, **_kwargs: False)
     monkeypatch.setattr("hermes_lcm.compaction.count_messages_tokens", lambda _value: 100)
 
-    assert engine.should_compress_preflight(messages) is True
+    assert engine.should_compress_preflight(messages) is False
 
 
-def test_host_pressure_blocks_model_work_when_lcm_estimate_is_above_floor(tmp_path, monkeypatch):
+def test_subthreshold_eligible_leaf_preflight_is_false_with_default_floor(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, maintenance_min_pressure_ratio=0.0)
+    engine.threshold_tokens = 100
+    messages = [{"role": "user", "content": "eligible backlog"}]
+
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: messages)
+    monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        engine,
+        "_leaf_compaction_candidate_status",
+        lambda *_args, **_kwargs: (True, "eligible raw backlog outside fresh tail"),
+    )
+    monkeypatch.setattr("hermes_lcm.compaction.count_messages_tokens", lambda _value: 99)
+
+    assert engine.should_compress_preflight(messages) is False
+
+
+def test_divergent_replay_over_threshold_never_admits_model_work_from_preflight(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path)
+    engine.threshold_tokens = 100
+    messages = [{"role": "user", "content": "original"}]
+    replay = [{"role": "user", "content": "rewritten"}]
+
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: replay)
+    monkeypatch.setattr(engine, "_replay_diff_requests_ingest_cleanup", lambda *_args: False)
+    monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
+    monkeypatch.setattr("hermes_lcm.compaction.count_messages_tokens", lambda _value: 1_000)
+
+    assert engine.should_compress_preflight(messages) is False
+
+
+def test_host_pressure_blocks_model_work_across_hermes_deepcopy_boundary(tmp_path, monkeypatch):
     engine = _engine(
         tmp_path,
         maintenance_min_pressure_ratio=1.0,
@@ -103,6 +141,7 @@ def test_host_pressure_blocks_model_work_when_lcm_estimate_is_above_floor(tmp_pa
         leaf_chunk_tokens=1,
     )
     engine.threshold_tokens = 100
+    engine._config.extraction_enabled = True
     messages = [
         {"role": "user", "content": "eligible old backlog"},
         {"role": "assistant", "content": "eligible old response"},
@@ -110,22 +149,34 @@ def test_host_pressure_blocks_model_work_when_lcm_estimate_is_above_floor(tmp_pa
     ]
     monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
     monkeypatch.setattr("hermes_lcm.compaction.count_messages_tokens", lambda _value: 150)
-    summary_calls = []
+    model_work_calls = []
 
-    def fail_if_called(*_args, **_kwargs):
-        summary_calls.append(True)
-        raise AssertionError("subthreshold automatic maintenance must not summarize")
+    def fail_if_called(stage):
+        def fail(*_args, **_kwargs):
+            model_work_calls.append(stage)
+            raise AssertionError(
+                f"subthreshold automatic maintenance must not run {stage}"
+            )
 
-    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", fail_if_called)
+        return fail
 
-    assert engine.should_compress_preflight(messages) is True
-    assert engine.compress(messages, current_tokens=20) == messages
+    monkeypatch.setattr(engine, "_run_pre_compaction_extraction", fail_if_called("extraction"))
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", fail_if_called("summarization"))
+    monkeypatch.setattr(engine, "_maybe_condense", fail_if_called("condensation"))
+    monkeypatch.setattr(engine._dag, "add_node", fail_if_called("DAG publication"))
+
+    assert engine.should_compress_preflight(messages) is False
+    copied_messages = deepcopy(messages)
+    assert engine.compress(copied_messages, current_tokens=20) == copied_messages
     assert engine._last_compression_status == "deferred"
     assert engine.compression_count == 0
-    assert summary_calls == []
+    assert model_work_calls == []
 
 
-def test_maintenance_intent_does_not_adopt_late_cleanup(tmp_path, monkeypatch):
+def test_subthreshold_host_pressure_does_not_adopt_unrequested_replay_diff(
+    tmp_path,
+    monkeypatch,
+):
     engine = _engine(
         tmp_path,
         maintenance_min_pressure_ratio=1.0,
@@ -155,7 +206,7 @@ def test_maintenance_intent_does_not_adopt_late_cleanup(tmp_path, monkeypatch):
         ),
     )
 
-    assert engine.should_compress_preflight(messages) is True
+    assert engine.should_compress_preflight(messages) is False
     assert engine.compress(messages, current_tokens=20) == messages
     assert engine._last_compression_status == "deferred"
     assert engine.compression_count == 0
@@ -164,7 +215,7 @@ def test_maintenance_intent_does_not_adopt_late_cleanup(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("current_tokens", "force"),
     [(100, False), (20, True)],
-    ids=["exact-floor", "manual-force"],
+    ids=["exact-threshold", "manual-force"],
 )
 def test_host_pressure_guard_preserves_explicit_admission(
     tmp_path,
@@ -194,61 +245,86 @@ def test_host_pressure_guard_preserves_explicit_admission(
         ),
     )
 
-    assert engine.should_compress_preflight(messages) is True
+    if not force:
+        assert engine.should_compress(current_tokens) is True
     with pytest.raises(AssertionError, match="admitted model work reached summarizer"):
         engine.compress(messages, current_tokens=current_tokens, force=force)
 
 
-def test_session_reset_clears_preflight_handoffs(tmp_path):
-    engine = _engine(tmp_path, maintenance_min_pressure_ratio=1.0)
-    engine._preflight_intent = "maintenance"
-    engine._preflight_session_id = engine.current_session_id
-    engine._preflight_message_list_id = 42
-    engine._preflight_cleanup_only_due_to_boundary_cooldown = True
-
-    engine._reset_session_scoped_runtime_state()
-
-    assert engine._preflight_intent is None
-    assert engine._preflight_session_id is None
-    assert engine._preflight_message_list_id is None
-    assert engine._preflight_cleanup_only_due_to_boundary_cooldown is False
-
-
-def test_preflight_intent_does_not_apply_to_different_message_list(tmp_path, monkeypatch):
+def test_configured_critical_pressure_uses_host_pressure_for_model_admission(
+    tmp_path,
+    monkeypatch,
+):
     engine = _engine(
         tmp_path,
         maintenance_min_pressure_ratio=1.0,
+        critical_budget_pressure_ratio=0.5,
         fresh_tail_count=1,
         leaf_chunk_tokens=1,
     )
-    engine.threshold_tokens = 100
-    preflight_messages = [
-        {"role": "user", "content": "old preflight backlog"},
-        {"role": "assistant", "content": "old preflight response"},
-        {"role": "user", "content": "old fresh tail"},
-    ]
-    direct_messages = [
-        {"role": "user", "content": "different direct backlog"},
-        {"role": "assistant", "content": "different direct response"},
-        {"role": "user", "content": "different fresh tail"},
+    engine.context_length = 200
+    engine.threshold_tokens = 150
+    messages = [
+        {"role": "user", "content": "eligible old backlog"},
+        {"role": "assistant", "content": "eligible old response"},
+        {"role": "user", "content": "fresh tail"},
     ]
     monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
-    monkeypatch.setattr("hermes_lcm.compaction.count_messages_tokens", lambda _value: 150)
     monkeypatch.setattr(
         engine,
         "_summarize_leaf_chunk_with_rescue",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("different direct compress reached summarizer")
+            AssertionError("critical host pressure reached summarizer")
         ),
     )
 
-    assert engine.should_compress_preflight(preflight_messages) is True
-    engine._preflight_cleanup_only_due_to_boundary_cooldown = True
-    with pytest.raises(AssertionError, match="different direct compress reached summarizer"):
-        engine.compress(direct_messages, current_tokens=20)
+    engine.last_prompt_tokens = 100
+    assert engine.should_compress(0) is False
+    assert engine.should_compress(99) is False
+    assert engine.should_compress(100) is True
+    with pytest.raises(AssertionError, match="critical host pressure reached summarizer"):
+        engine.compress(deepcopy(messages), current_tokens=100)
 
 
-def test_empty_compress_consumes_preflight_intent(tmp_path, monkeypatch):
+def test_ignored_backlog_and_debt_are_deferred_without_model_work(tmp_path, monkeypatch):
+    engine = _engine(
+        tmp_path,
+        deferred_maintenance_enabled=True,
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+    )
+    engine.threshold_tokens = 100
+    messages = [
+        {"role": "user", "content": "ignored old backlog"},
+        {"role": "user", "content": "fresh tail"},
+    ]
+    engine._lifecycle.record_debt(
+        engine._conversation_id,
+        kind="raw_backlog",
+        size_estimate=10,
+    )
+    model_work_calls = []
+
+    def fail_if_called(stage):
+        def fail(*_args, **_kwargs):
+            model_work_calls.append(stage)
+            raise AssertionError(f"preflight must not run {stage}")
+
+        return fail
+
+    monkeypatch.setattr(engine, "_should_force_overflow_recovery", lambda **_kwargs: False)
+    monkeypatch.setattr(engine, "_has_ignored_backlog_outside_fresh_tail", lambda _messages: True)
+    monkeypatch.setattr(engine, "_run_pre_compaction_extraction", fail_if_called("extraction"))
+    monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", fail_if_called("summarization"))
+    monkeypatch.setattr(engine, "_maybe_condense", fail_if_called("condensation"))
+    monkeypatch.setattr(engine._dag, "add_node", fail_if_called("DAG publication"))
+
+    assert engine.should_compress_preflight(messages) is False
+    assert engine._has_raw_backlog_debt() is True
+    assert model_work_calls == []
+
+
+def test_legacy_direct_compress_without_host_tokens_remains_admitted(tmp_path, monkeypatch):
     engine = _engine(
         tmp_path,
         maintenance_min_pressure_ratio=1.0,
@@ -267,14 +343,12 @@ def test_empty_compress_consumes_preflight_intent(tmp_path, monkeypatch):
         engine,
         "_summarize_leaf_chunk_with_rescue",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("unmarked direct compress reached summarizer")
+            AssertionError("legacy direct compress reached summarizer")
         ),
     )
 
-    assert engine.should_compress_preflight(messages) is True
-    assert engine.compress([]) == []
-    with pytest.raises(AssertionError, match="unmarked direct compress reached summarizer"):
-        engine.compress(messages, current_tokens=20)
+    with pytest.raises(AssertionError, match="legacy direct compress reached summarizer"):
+        engine.compress(messages, current_tokens=None)
 
 
 def test_divergent_replay_ignored_backlog_respects_pressure_floor(tmp_path, monkeypatch):

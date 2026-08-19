@@ -242,7 +242,7 @@ def test_sensitive_patterns_redact_before_summary_serialization(tmp_path, monkey
             {"role": "user", "content": f"api_key={secret} should be hidden"},
             {"role": "user", "content": "fresh tail"},
         ],
-        current_tokens=10_000,
+        current_tokens=engine.threshold_tokens,
     )
 
     assert captured["text"]
@@ -969,7 +969,7 @@ def test_tool_result_ingest_preserves_active_context_while_protecting_storage(tm
     assert _expand_ref(engine, ref)["content"] == DATA_URI
 
 
-def test_preflight_storage_protection_does_not_force_noop_compaction(tmp_path):
+def test_preflight_storage_protection_does_not_publish_compaction_status(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         large_output_externalization_path=str(tmp_path / "externalized"),
@@ -990,8 +990,8 @@ def test_preflight_storage_protection_does_not_force_noop_compaction(tmp_path):
 
     assert engine.should_compress_preflight(deepcopy(messages)) is False
     assert engine.should_compress_preflight(deepcopy(messages)) is False
-    assert engine._last_compression_status == "noop"
-    assert engine._last_compression_noop_reason == "no eligible raw backlog outside fresh tail"
+    assert engine._last_compression_status == "idle"
+    assert engine._last_compression_noop_reason == ""
     assert engine._store.count_session_load_messages(engine.current_session_id) == 2
     _store_id, content, _tool_calls = _single_message_row(engine, role="user")
     assert "data:image" not in content

@@ -55,14 +55,79 @@ them.
 1. **Persists messages** in a plugin-local SQLite store with FTS metadata.
 2. **Compacts older context** into depth-aware summary nodes.
 3. **Condenses summaries** into a hierarchical DAG as they accumulate.
-4. **Assembles active context** from system prompt, highest-value summaries, and
-   the protected fresh tail.
-5. **Provides recall tools** so agents can search, inspect, and expand compacted
+4. **Projects every provider request** through Hermes `select_context()` from the
+   canonical conversation, current DAG frontier, and immutable request envelope;
+   threshold-triggered `compress()` remains the separate model-backed maintenance
+   path.
+5. **Observes completed turns** through Hermes `on_turn_complete()` and persists
+   only the finalized canonical transcript, idempotently and without model work.
+6. **Provides recall tools** so agents can search, inspect, and expand compacted
    material without flooding the main prompt.
 
 Nothing is lost in normal operation. Raw messages stay recoverable in bounded
 pages, summaries retain source lineage, and oversized externalized payloads keep
 stable refs for later expansion.
+
+Request projection is deterministic and model-free. The plugin requires a
+unique canonical `conversation_messages` occurrence to align through the end of
+the provider request. Alignment requires exact replay-significant role/tool
+metadata. User/assistant request content may equal canonical `content` or a
+nonempty canonical `api_content` replay sidecar; only the trusted incoming
+occurrence may additionally carry Hermes's append-only provider context, including
+the string and structured trailing-text MoA shapes. Historical prefix matches,
+tool metadata drift, and request suffixes fail open. LCM ingests only clean
+canonical content, while projected current-turn messages preserve request-side
+content and metadata.
+
+After alignment, LCM removes role-valid generated replay scaffold (LCM notes as
+system messages; complete summary or preserved-objective blocks as user
+messages), except that the exact trusted incoming canonical occurrence is always
+retained. Older identical scaffold occurrences remain filtered. The trusted
+incoming user and every same-turn assistant/tool message through request end are
+an atomic required slice: immutable request material and that slice are budgeted
+first, the DAG summary is admitted only afterward, and an over-budget required
+slice makes selection fail open. The effective cap is the smaller positive value
+of the host budget and LCM `threshold_tokens`, reserving Hermes's tool/output
+headroom rather than packing history to the full context window; a nonpositive
+threshold fails open. Hosts that omit the incoming marker conservatively reserve
+the newest complete eligible turn group. The projection also preserves
+request-only cache metadata plus host-shaped prefill immediately before canonical
+history (after at most one system envelope). The generic hook does not mark
+trusted prefill, so LCM validates only this insertion position and conservative
+user/assistant shape; it does not invent a trust marker. Projection selects the
+current DAG summaries plus a budgeted fresh tail and does not call the summarizer,
+extraction, condensation, proactive recall, embedding/provider resolution, or
+projection-only externalization paths.
+
+Post-turn observation is best-effort coverage, not a guarantee for every host
+early-exit path. It ignores usage, request metadata, and prefill; preserves the
+canonical message/tool representation through the normal ingest-protection
+path; and filters the same role-valid, complete LCM scaffold shapes before
+persistence, except for the most recent canonical user occurrence that defines
+the finalized turn boundary. Thus an exact scaffold-shaped current request is
+durable while identical older generated replay remains filtered. Assistant/tool
+marker lookalikes and ordinary user prose that only mentions scaffold markers
+remain canonical. Duplicate
+callbacks and a later `select_context()` fallback reconcile without duplicate
+rows or token telemetry. Modern Hermes hosts use the generic context-engine
+hook exclusively; older hosts without that base hook retain the legacy
+`post_llm_call` compatibility scan. This describes fork source behavior only
+and does not claim installation or managed-runtime promotion.
+
+Model-backed maintenance is admitted only from host pressure. Normal
+compaction enters through `should_compress(prompt_tokens)` at the unchanged
+context threshold, trusting Hermes's existing host-owned request-pressure
+estimate rather than claiming provider-measured telemetry. A nonzero
+`critical_budget_pressure_ratio` adds an earlier host-pressure admission point;
+its default `0` remains disabled. The later
+`should_compress_preflight(messages)` compatibility fallback may still ingest
+and persist deterministic protection, but rough message/replay estimates never
+authorize leaf summarization, extraction, condensation, deferred debt work, or
+DAG publication. Preflight returns true only to publish deterministic replay
+cleanup (optional cleanup must strictly shrink) or recover a detectable
+assembly overflow. Cooldown does not suppress those two safety paths. A
+configured `maintenance_min_pressure_ratio` remains a defense inside direct
+automatic `compress(current_tokens=...)` calls, not preflight authority.
 
 <p align="center">
   <img src="docs/standard_compression.png" alt="Standard compression" width="700">

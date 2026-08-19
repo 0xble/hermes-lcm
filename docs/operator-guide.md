@@ -152,6 +152,138 @@ session. It does not modify the system prompt or activate when another context
 engine is serving the turn. Its canonical file and digest source is
 `skills/hermes-lcm/references/recall-policy.md`.
 
+### Verify deterministic request projection in a source checkout
+
+Hermes hosts that expose `ContextEngine.select_context()` call LCM before each
+provider request, independently of `should_compress()`. LCM requires one unique
+canonical `conversation_messages` occurrence to align through request end. Each
+occurrence must preserve exact replay-significant role, tool-call ID, tool name,
+and tool-call structure/arguments. User/assistant request content may equal the
+canonical `content` or its nonempty `api_content` replay sidecar. Only the trusted
+incoming occurrence may additionally carry Hermes's append-only provider context:
+a string base plus a `\n\n` suffix, or an exact structured-content prefix followed
+by provider-only text parts (the MoA shapes). Historical append-only mismatches,
+tool metadata drift, any request suffix, or another ambiguous alignment returns
+`None` before ingest. Request-side content and annotations remain on the projected
+current turn, while only a copy of the clean canonical content is ingested.
+
+LCM then removes only role-valid generated replay scaffolds from aligned
+canonical/request pairs before durable ingest or cursor/store-id mapping: an LCM
+note must be a system message; a preserved-objective or complete summary block
+must be a user message. Complete multi-summary projections joined by the generated
+separator are recognized. The exact canonical occurrence identified by the
+trusted `incoming_message` object is exempt, even when its content has one of
+those exact scaffold shapes; older identical occurrences are still filtered. A
+supplied incoming object that cannot be located unambiguously makes selection
+fail open before ingest. Request-only cache annotations and host-shaped prefill
+immediately before the canonical span (after at most one leading system envelope)
+remain byte-stable and are never ingested.
+
+The generic host hook provides no trusted prefill marker. LCM therefore accepts
+only that host insertion position with conservative user/assistant message
+shapes; this positional check cannot authenticate configured prefill, and LCM
+does not invent a marker. Selection is model-free: it reads the existing DAG
+frontier, then sets an effective cap from LCM `threshold_tokens` and any smaller
+positive host budget. This uses the established host compaction boundary as the
+prompt-safe limit instead of filling the full context window; a nonpositive
+threshold fails open. Within that cap, selection budgets the immutable
+envelope/prefill plus the required active turn from trusted incoming user through
+request end. If that atomic slice does not fit, selection fails open. Current DAG
+summaries are admitted only from the remaining budget, followed by complete older
+turn/tool groups newest-backward. Compatibility hosts without an incoming marker
+reserve the newest complete eligible turn group. Final provider sanitation remains
+Hermes's responsibility.
+Canonical payload protection may externalize durable conversation payloads
+idempotently during reconciliation; projection-only/request-only material does
+not invoke active-replay stubbing or externalization.
+
+Run the focused source regression:
+
+```bash
+/Users/brianle/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_context_selection.py -q
+```
+
+A green source test proves checkout behavior only. It does not prove this
+checkout has been installed, promoted, or loaded by any managed Hermes runtime.
+
+### Verify best-effort completed-turn observation in a source checkout
+
+Hermes hosts that expose `ContextEngine.on_turn_complete()` notify LCM after
+standard turn finalization. LCM treats the supplied message list as the
+read-only canonical persisted transcript: only those role-valid, complete LCM
+replay scaffold shapes are filtered, except that the most recent user occurrence
+defines the finalized current-turn boundary and is retained even when it exactly
+matches a generated scaffold. Identical older occurrences remain filtered.
+Assistant/tool marker lookalikes and user prose that merely quotes or mentions
+scaffold markers remain canonical, while
+roles, content, timestamps, tool calls, tool names, and tool-result pairing
+continue through the existing ingest/protection path. The callback needs no
+extra host metadata because standard finalized-turn semantics place the current
+user last among user messages, followed only by its assistant/tool loop.
+The callback is deterministic and model-free. It ignores `usage` and all extra
+metadata, does not update token telemetry, retrieve context, summarize,
+extract, condense, call a provider, or publish DAG nodes.
+
+Observation is idempotent across duplicate callbacks, retries, filtered and
+legacy unfiltered cursor views, a missed callback followed by lazy
+`select_context()` reconciliation, and a later callback after that fallback.
+Failures are swallowed and counted once in the existing ingest diagnostics.
+Ignored, stateless, and auxiliary behavior remains unchanged. Host coverage is
+best-effort: abnormal early exits that bypass the host's standard finalization
+seam may not emit the callback, so `select_context()` remains the lazy fallback.
+
+On a modern host the plugin does not also register its legacy `post_llm_call`
+ingest hook, avoiding a duplicate full-transcript scan. Hosts whose
+`ContextEngine` base lacks `on_turn_complete()` keep that hook as a compatibility
+fallback, including its existing clone/session rebinding behavior.
+
+Run the focused source regressions:
+
+```bash
+/Users/brianle/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_turn_observation.py \
+  tests/test_packaging_install.py -q
+```
+
+As with request projection, a green source test does not prove installation or
+promotion to any managed Hermes runtime.
+
+### Verify model work is admitted from host pressure
+
+Modern Hermes evaluates `should_compress(prompt_tokens)` with its existing
+host-owned request-pressure estimate before falling back to
+`should_compress_preflight(messages)`. LCM trusts that host estimate; it does
+not claim provider-measured token telemetry. Normal model-backed compaction
+remains admitted at `threshold_tokens`. If `critical_budget_pressure_ratio` is
+explicitly greater than zero, the host estimate at that fraction of
+`context_length` also admits model work and bypasses the lower maintenance-floor
+defense in `compress()`; the default zero disables critical admission. Tokens
+just below either active boundary do not admit it.
+
+Preflight rough token counts are not pressure authority. The compatibility
+fallback may ingest canonical messages and refresh raw-backlog debt, but
+eligible leaves, divergent replay transformation, ignored backlog, and
+deferred debt all return false without extraction, summarization, condensation,
+or DAG publication. It returns true only when ingest produced deterministic
+cleanup that should be adopted, or when message estimates expose forced
+overflow recovery. Optional externalization cleanup must strictly shrink;
+mandatory redaction, quarantine, ignored-placeholder cleanup, tool repair, and
+overflow remain available during boundary cooldown. `force=True` and legacy
+direct `compress(current_tokens=None)` retain their existing explicit behavior.
+
+Run the focused source policy regressions:
+
+```bash
+/Users/brianle/.hermes/hermes-agent/venv/bin/python -m pytest \
+  tests/test_maintenance_pressure_floor.py \
+  tests/test_optional_cleanup_admission.py \
+  tests/test_active_tool_stubbing.py -q
+```
+
+These checks prove source behavior only. They do not modify configuration,
+data, Hermes core, or a managed runtime.
+
 ## Troubleshooting
 
 ### `hermes plugins` shows `lcm (not found)` but LCM tools exist

@@ -489,8 +489,8 @@ class LCMConfig:
     critical_budget_pressure_ratio: float = 0.0
     # Opt into one bounded synchronous sweep after threshold pressure is reached.
     threshold_full_sweep_enabled: bool = False
-    # Minimum fraction of threshold_tokens required for opportunistic
-    # divergent-replay maintenance. 0.0 preserves historical behavior.
+    # Direct automatic compress() defense below this fraction of threshold_tokens.
+    # It never authorizes model-backed preflight work; 0.0 disables the defense.
     maintenance_min_pressure_ratio: float = 0.0
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0

@@ -125,6 +125,7 @@ from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
+from .context_selection import ContextSelectionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
@@ -360,7 +361,7 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
-class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
+class LCMEngine(ContextSelectionMixin, CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -556,15 +557,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
-        # One-shot handoff from preflight: adopt an already-durable replay
-        # cleanup during boundary cooldown without running summary work.
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
-        # One-shot handoff identifying why automatic preflight requested a pass.
-        # compress() consumes this before deciding whether host-observed pressure
-        # admits model-backed work or cleanup-only adoption.
-        self._preflight_intent: Optional[str] = None
-        self._preflight_session_id: Optional[str] = None
-        self._preflight_message_list_id: Optional[int] = None
+
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
@@ -1005,9 +998,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status in {"noop", "deferred"}
 
-    def _mark_preflight_compression_requested(self, intent: str = "maintenance") -> bool:
+    def _mark_preflight_compression_requested(self) -> bool:
         """Record that preflight found work and clear any stale no-op reason."""
-        self._preflight_intent = intent
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
         return True
@@ -1504,11 +1496,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def ingest(self, messages: List[Dict[str, Any]]) -> None:
         """Persist messages to the durable store every turn.
 
-        Called by the post_llm_call plugin hook so messages land in LCM
-        regardless of whether compression triggers — short WebUI
-        conversations never hit the compression threshold and never
-        expire like Telegram sessions do, so without this they'd never
-        be ingested.
+        Retained for the legacy ``post_llm_call`` compatibility hook. Modern
+        hosts use ``on_turn_complete()``; both paths share the same ingest
+        cursor so short conversations land in LCM without requiring compaction.
 
         Uses the same _ingest_messages cursor as compress(), so if
         compression runs later the same turn, already-ingested messages
@@ -1536,6 +1526,73 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
             except Exception as e:
                 self._record_ingest_failure("per-turn ingest()", e)
+
+    def on_turn_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        usage: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Best-effort, model-free observation of one finalized host turn.
+
+        The host transcript is the sole source: usage, request metadata, and
+        other compatibility fields are deliberately ignored. Recognized LCM
+        replay scaffolds are projection artifacts and never become durable rows.
+        """
+        del usage, kwargs
+        try:
+            if not isinstance(messages, list):
+                return
+            if not all(isinstance(message, dict) for message in messages):
+                return
+            # Hermes structurally clones the finalized transcript before this
+            # hook. Treat that snapshot as read-only: filtering allocates a new
+            # list, while ingest/protection paths make the copies they own.
+            canonical_messages = messages
+            if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
+                self._remember_lcm_bypass_message_prefix(
+                    self._bypass_lcm_session_id(),
+                    canonical_messages,
+                )
+                return
+            if self._bypasses_lcm_context_management():
+                self._remember_lcm_bypass_message_prefix(
+                    self._bypass_lcm_session_id(),
+                    canonical_messages,
+                )
+                return
+            if not self._session_id or not canonical_messages:
+                return
+
+            self._remember_lcm_normal_message_prefix(
+                self._session_id,
+                canonical_messages,
+                conversation_id=self._conversation_id,
+            )
+            current_user_index = next(
+                (
+                    index
+                    for index in range(len(canonical_messages) - 1, -1, -1)
+                    if canonical_messages[index].get("role") == "user"
+                ),
+                None,
+            )
+            durable_messages = [
+                message
+                for index, message in enumerate(canonical_messages)
+                if (
+                    index == current_user_index
+                    or not self._is_replayed_context_scaffold_message(message)
+                )
+            ]
+            self._ingest_filtered_durable_view(
+                durable_messages,
+                canonical_messages,
+            )
+            self._record_ingest_success()
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+        except Exception as exc:
+            self._record_ingest_failure("on_turn_complete observation", exc)
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -4176,7 +4233,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
-        """Return true for active-context scaffolding that should not be re-ingested."""
+        """Return true only for role-valid, generated active-context scaffolds.
+
+        A syntactically exact user scaffold is indistinguishable from canonical
+        user content without host metadata, so this boundary intentionally uses
+        the generated role and complete content shape rather than marker search.
+        """
         role = str(msg.get("role") or "")
         content = normalize_content_value(msg.get("content")) or ""
         if role == "system":
@@ -4184,16 +4246,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "[Note: This conversation uses Lossless Context Management (LCM)." in content
                 and "Earlier turns have been compacted into hierarchical summaries below." in content
             )
-        if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
-            return True
-        if "[Expand for details:" not in content:
+        if role != "user":
             return False
-        return bool(
-            re.search(
-                r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]",
-                content,
-            )
-        )
+        if self._is_preserved_objective_scaffold_message(msg):
+            return True
+        return self._looks_like_active_summary_blob(content)
 
     def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
         if isinstance(value, dict):

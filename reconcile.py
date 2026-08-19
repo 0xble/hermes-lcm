@@ -54,6 +54,18 @@ _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from co
 
 class ReconcileMixin:
     @staticmethod
+    def _is_preserved_objective_scaffold_message(msg: Dict[str, Any]) -> bool:
+        """Return true only for the generated user objective scaffold shape."""
+        if str(msg.get("role") or "") != "user":
+            return False
+        content = normalize_content_value(msg.get("content")) or ""
+        normalized = content.lstrip()
+        objective_header = f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n"
+        return normalized.startswith(objective_header) and bool(
+            normalized[len(objective_header) :].strip()
+        )
+
+    @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
             return {
@@ -705,10 +717,7 @@ class ReconcileMixin:
                 and raw_session_count > 1
             )
             has_preserved_objective_scaffold = any(
-                str(msg.get("role") or "") != "system"
-                and (normalize_content_value(msg.get("content")) or "").lstrip().startswith(
-                    _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
-                )
+                self._is_preserved_objective_scaffold_message(msg)
                 for msg in candidate_messages
             )
             candidate_suffix_has_user_turn = any(identity[0] == "user" for identity in candidate_prefix)

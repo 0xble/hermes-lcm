@@ -366,7 +366,7 @@ def test_live_stub_adoption_outranks_compression_boundary_cooldown(make_engine):
     assert engine.last_compression_status == "sanitized"
 
 
-def test_flag_off_plain_preflight_cooldown_blocks_threshold_and_overflow(make_engine):
+def test_flag_off_plain_preflight_cooldown_does_not_block_overflow(make_engine):
     engine = make_engine(
         large_output_active_replay_stubbing_enabled=False,
         max_assembly_tokens=10,
@@ -376,21 +376,7 @@ def test_flag_off_plain_preflight_cooldown_blocks_threshold_and_overflow(make_en
     messages = [{"role": "user", "content": "plain branch pressure " * 100}]
 
     assert engine._should_force_overflow_recovery(messages=messages) is True
-    assert engine.should_compress_preflight(messages) is False
-
-
-def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(
-    make_engine,
-    monkeypatch,
-):
-    engine = make_engine(large_output_active_replay_stubbing_enabled=False)
-    engine.threshold_tokens = 100_000
-    engine._last_boundary_skip_time = time.time()
-    messages, cleanup_messages = externalized_raw_cleanup_messages()
-    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
-
     assert engine.should_compress_preflight(messages) is True
-    assert engine._preflight_cleanup_only_due_to_boundary_cooldown is True
 
 
 def test_flag_off_replay_cleanup_cooldown_publishes_without_summary_llm(

@@ -4561,7 +4561,7 @@ class TestAssemblyBudgetSelection:
         replay._ingest_cursor_needs_reconcile = True
         replay._ingest_messages([
             {
-                "role": "assistant",
+                "role": "user",
                 "content": "[Current user objective preserved from compacted history]\nstored setup",
             },
             {"role": "user", "content": "repeat me"},

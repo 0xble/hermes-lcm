@@ -1672,13 +1672,10 @@ class TestEngineABC:
         try:
             assert count_messages_tokens(messages) >= instance.threshold_tokens
             assert not instance.should_compress_preflight(messages)
-            assert instance.last_compression_status == "deferred"
-            assert instance.last_compression_was_noop is True
-            assert "below leaf chunk threshold" in instance.last_compression_noop_reason
         finally:
             instance.shutdown()
 
-    def test_positive_preflight_clears_prior_noop_status(self, tmp_path):
+    def test_preflight_does_not_admit_model_candidates_from_rough_tokens(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_clears_noop.db"),
             fresh_tail_count=4,
@@ -1712,17 +1709,11 @@ class TestEngineABC:
 
         try:
             assert instance.should_compress_preflight(noop_messages) is False
-            assert instance.last_compression_was_noop is True
-            assert instance.last_compression_noop_reason
-
-            assert instance.should_compress_preflight(eligible_messages) is True
-            assert instance.last_compression_status == "pending"
-            assert instance.last_compression_was_noop is False
-            assert instance.last_compression_noop_reason == ""
+            assert instance.should_compress_preflight(eligible_messages) is False
         finally:
             instance.shutdown()
 
-    def test_preflight_requests_compaction_for_deferred_maintenance_under_critical_pressure(self, tmp_path):
+    def test_preflight_defers_maintenance_even_when_rough_tokens_look_critical(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_deferred_critical.db"),
             fresh_tail_count=4,
@@ -1754,11 +1745,11 @@ class TestEngineABC:
                 size_estimate=instance._raw_backlog_tokens(messages),
             )
             assert instance._should_run_deferred_maintenance(messages, observed_tokens=rough)
-            assert instance.should_compress_preflight(messages)
+            assert not instance.should_compress_preflight(messages)
         finally:
             instance.shutdown()
 
-    def test_preflight_requests_compaction_when_old_backlog_has_leaf_chunk(self, tmp_path):
+    def test_preflight_defers_compaction_when_old_backlog_has_leaf_chunk(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_leaf_chunk.db"),
             fresh_tail_count=4,
@@ -1778,7 +1769,7 @@ class TestEngineABC:
         ]
         try:
             assert count_messages_tokens(messages) >= instance.threshold_tokens
-            assert instance.should_compress_preflight(messages)
+            assert not instance.should_compress_preflight(messages)
         finally:
             instance.shutdown()
 
@@ -1798,7 +1789,7 @@ class TestEngineABC:
             ("stateless:session", {"stateless_session_patterns": ["stateless:*"]}),
         ],
     )
-    def test_bypassed_sessions_request_host_compaction_without_lcm_writes(
+    def test_bypassed_sessions_use_host_pressure_without_lcm_writes(
         self,
         tmp_path,
         session_id,
@@ -1820,7 +1811,7 @@ class TestEngineABC:
 
             assert instance._store.get_session_count(session_id) == 0
             assert instance._dag.get_session_node_count(session_id) == 0
-            assert instance.should_compress_preflight(messages)
+            assert not instance.should_compress_preflight(messages)
             assert instance.should_compress(instance.threshold_tokens + 1)
         finally:
             instance.shutdown()
@@ -1853,7 +1844,7 @@ class TestEngineABC:
         try:
             instance.on_session_start(session_id, platform="cli", context_length=1_000)
             instance.threshold_tokens = 20
-            assert instance.should_compress_preflight(messages)
+            assert not instance.should_compress_preflight(messages)
 
             instance.on_session_start(
                 child_session_id,
@@ -1870,7 +1861,7 @@ class TestEngineABC:
             assert instance._store.get_session_count(child_session_id) == 0
             assert instance._dag.get_session_node_count(session_id) == 0
             assert instance._dag.get_session_node_count(child_session_id) == 0
-            assert instance.should_compress_preflight(child_messages)
+            assert not instance.should_compress_preflight(child_messages)
 
             instance.on_session_start(
                 grandchild_session_id,
@@ -1884,7 +1875,7 @@ class TestEngineABC:
 
             assert instance._store.get_session_count(grandchild_session_id) == 0
             assert instance._dag.get_session_node_count(grandchild_session_id) == 0
-            assert instance.should_compress_preflight(child_messages)
+            assert not instance.should_compress_preflight(child_messages)
         finally:
             instance.shutdown()
 
@@ -2203,7 +2194,7 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
-    def test_thread_context_stateless_requests_host_compaction_without_lcm_writes(self, tmp_path):
+    def test_thread_context_stateless_uses_host_pressure_without_lcm_writes(self, tmp_path):
         config = LCMConfig(database_path=str(tmp_path / "thread-stateless.db"))
         instance = LCMEngine(config=config)
         messages = self._oversized_bypass_messages()
@@ -2217,7 +2208,7 @@ class TestEngineABC:
 
             assert instance._store.get_session_count("foreground:session") == 0
             assert instance._dag.get_session_node_count("foreground:session") == 0
-            assert instance.should_compress_preflight(messages)
+            assert not instance.should_compress_preflight(messages)
             assert instance.should_compress(instance.threshold_tokens + 1)
         finally:
             instance.shutdown()
@@ -3691,7 +3682,7 @@ class TestEngineABC:
                 "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
             },
             {
-                "role": "assistant",
+                "role": "user",
                 "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
             },
             {"role": "user", "content": "fresh user tail"},
@@ -4625,6 +4616,82 @@ class TestEngineABC:
         assert reconciliation["reason"] == "persisted ambiguous delta"
         assert reconciliation["action"] == "persisted batch"
 
+    def test_reconcile_persists_repeated_assistant_objective_lookalike_singleton(self, tmp_path):
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "assistant-objective-lookalike.db"))
+        )
+        instance.on_session_start(
+            "assistant-objective-lookalike-session",
+            platform="cli",
+            context_length=200000,
+        )
+        repeated = {
+            "role": "assistant",
+            "content": (
+                "[Current user objective preserved from compacted history]\n"
+                "legitimate assistant response"
+            ),
+        }
+        instance._ingest_messages([repeated])
+        instance._ingest_cursor_needs_reconcile = True
+
+        instance._ingest_messages([repeated])
+
+        rows = instance._store.get_session_messages("assistant-objective-lookalike-session")
+        assert [(row["role"], row["content"]) for row in rows] == [
+            ("assistant", repeated["content"]),
+            ("assistant", repeated["content"]),
+        ]
+        assert instance.get_status()["ingest_reconciliation"] == {
+            "action": "persisted batch",
+            "reason": "persisted ambiguous delta",
+            "cursor": 0,
+            "incoming": 1,
+            "session_count": 1,
+            "stored_tail_count": 1,
+            "effective_incoming": 1,
+        }
+
+    def test_reconcile_persists_repeated_tool_objective_lookalike_singleton(self, tmp_path):
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "tool-objective-lookalike.db"))
+        )
+        instance.on_session_start(
+            "tool-objective-lookalike-session",
+            platform="cli",
+            context_length=200000,
+        )
+        repeated = {
+            "role": "tool",
+            "tool_call_id": "objective-lookalike-call",
+            "content": (
+                "[Current user objective preserved from compacted history]\n"
+                "legitimate tool result"
+            ),
+        }
+        instance._ingest_messages([repeated])
+        instance._ingest_cursor_needs_reconcile = True
+
+        instance._ingest_messages([repeated])
+
+        rows = instance._store.get_session_messages("tool-objective-lookalike-session")
+        assert [
+            (row["role"], row["tool_call_id"], row["content"])
+            for row in rows
+        ] == [
+            ("tool", "objective-lookalike-call", repeated["content"]),
+            ("tool", "objective-lookalike-call", repeated["content"]),
+        ]
+        assert instance.get_status()["ingest_reconciliation"] == {
+            "action": "persisted batch",
+            "reason": "persisted ambiguous delta",
+            "cursor": 0,
+            "incoming": 1,
+            "session_count": 1,
+            "stored_tail_count": 1,
+            "effective_incoming": 1,
+        }
+
     def test_existing_session_restart_scaffold_prefix_does_not_skip_unrelated_new_rows(self, tmp_path):
         db_path = tmp_path / "restart-scaffold-prefix-unrelated.db"
         config = LCMConfig(database_path=str(db_path))
@@ -4658,7 +4725,7 @@ class TestEngineABC:
                 "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
             },
             {
-                "role": "assistant",
+                "role": "user",
                 "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
             },
             {"role": "user", "content": "unrelated new request"},
@@ -4717,7 +4784,7 @@ class TestEngineABC:
                 "content": "[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
             },
             {
-                "role": "assistant",
+                "role": "user",
                 "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
             },
             {"role": "user", "content": "old first question"},
@@ -4957,12 +5024,17 @@ class TestEngineABC:
         def boom(_messages):
             raise sqlite3.OperationalError("disk I/O error")
 
+        engine._last_compression_status = "deferred"
+        engine._last_compression_noop_reason = "stale deferred reason"
         engine._ingest_messages = boom
         engine._should_force_overflow_recovery = lambda **kwargs: True
 
         assert engine.should_compress_preflight(
             [{"role": "user", "content": "over-limit turn"}]
         ) is True
+        assert engine.last_compression_status == "pending"
+        assert engine.last_compression_noop_reason == ""
+        assert engine.last_compression_was_noop is False
 
     def test_tool_call_ingest_failure_is_surfaced_in_status(self, engine):
         engine.on_session_start("live-search-failure", platform="telegram", context_length=200000)
@@ -5608,7 +5680,11 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog objective" in captured["text"]
         assert "SECRET" not in captured["text"]
@@ -5640,7 +5716,11 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog objective" in captured["text"]
         assert "SECRET" not in captured["text"]
@@ -5684,7 +5764,11 @@ class TestMessageFiltering:
             {"role": "user", "content": "fresh visible request"},
         ]
 
-        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result = engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
         result_text = "\n".join(str(msg.get("content", "")) for msg in result)
 
         assert "carry this objective forward" not in result_text
@@ -5714,7 +5798,11 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog objective" in captured["text"]
         assert "api_key" not in captured["text"]
@@ -7204,7 +7292,11 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog should extract" in captured["serialized"]
         assert "visible backlog should extract" in captured["summary_text"]
@@ -7255,7 +7347,11 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible historical backlog " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+                force=True,
+            )
 
             nodes = second._dag.get_session_nodes("session")
             assert nodes
@@ -7314,7 +7410,11 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible historical backlog " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+                force=True,
+            )
 
             assert "visible historical backlog" in captured["text"]
             assert "SECRET_PAYLOAD_MARKER" not in captured["text"]
@@ -7432,7 +7532,11 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+                force=True,
+            )
 
             rows = second._store.get_session_messages("session")
             assert rows[1]["content"].startswith("visible backlog objective")
@@ -7533,7 +7637,11 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+                force=True,
+            )
 
             stored_after = second._store.get_session_messages("session")
             externalized_rows = [row for row in stored_after if row["content"].startswith("[Externalized payload:")]
@@ -7614,7 +7722,11 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+                force=True,
+            )
 
             assert "visible backlog objective" in captured["text"]
             assert "visible assistant tool call" not in captured["text"]
@@ -8033,7 +8145,11 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog objective" in captured["text"]
         assert "dependent assistant reply" not in captured["text"]
@@ -8068,7 +8184,11 @@ class TestMessageFiltering:
             {"role": "user", "content": "fresh tail request"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog objective" in captured["text"]
         assert "assistant reply derived from ignored system" not in captured["text"]
@@ -8097,7 +8217,11 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result = engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
         result_text = "\n".join(str(msg.get("content", "")) for msg in result)
 
         assert "visible backlog objective" in captured["text"]
@@ -9209,7 +9333,11 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog objective" in captured["text"]
         assert "dependent tool result" not in captured["text"]
@@ -9237,7 +9365,11 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog objective" in captured["text"]
         assert "assistant answer derived" not in captured["text"]
@@ -9399,7 +9531,11 @@ class TestMessageFiltering:
             {"role": "user", "content": "SECRET ignored fresh tail must not become focus"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
 
         assert "visible backlog objective" in captured["text"]
         assert "SECRET" not in captured["text"]
@@ -10395,7 +10531,7 @@ class TestEngineCompress:
             + "\n[Expand for details: prior details]"
         )
         messages = [
-            {"role": "assistant", "content": active_summary_marker},
+            {"role": "user", "content": active_summary_marker},
             {"role": "user", "content": "fresh tail question"},
             {"role": "assistant", "content": "fresh tail answer"},
         ]
@@ -11454,7 +11590,7 @@ class TestEngineCompress:
         finally:
             instance.shutdown()
 
-    def test_threshold_full_sweep_preflight_accepts_partial_leaf_at_threshold(self, tmp_path):
+    def test_threshold_full_sweep_uses_host_pressure_not_preflight(self, tmp_path):
         config = LCMConfig(
             fresh_tail_count=2,
             leaf_chunk_tokens=20_000,
@@ -11471,7 +11607,8 @@ class TestEngineCompress:
         ]
         instance.threshold_tokens = count_messages_tokens(messages)
         try:
-            assert instance.should_compress_preflight(messages) is True
+            assert instance.should_compress_preflight(messages) is False
+            assert instance.should_compress(instance.threshold_tokens) is True
         finally:
             instance.shutdown()
 
@@ -20323,7 +20460,7 @@ class TestDeferredMaintenanceDebt:
         assert state is not None
         assert state.debt_kind == "raw_backlog"
         assert state.debt_size_estimate > 0
-        assert engine.should_compress_preflight(compressed) is True
+        assert engine.should_compress_preflight(compressed) is False
         refreshed = engine._lifecycle.get_by_conversation(engine._conversation_id)
         assert refreshed is not None
         assert refreshed.debt_kind == "raw_backlog"

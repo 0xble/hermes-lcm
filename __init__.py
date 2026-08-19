@@ -57,6 +57,16 @@ def _host_forwards_registered_tool_messages(ctx) -> bool:
     return bool(capability)
 
 
+def _host_context_engine_supports_turn_observation() -> bool:
+    """Return whether the host owns post-turn observation on ContextEngine."""
+    try:
+        from agent.context_engine import ContextEngine
+
+        return callable(getattr(ContextEngine, "on_turn_complete", None))
+    except Exception:
+        return False
+
+
 def _engine_bound_session_id(engine) -> str:
     """Return the lifecycle/ingest session bound on an LCM engine.
 
@@ -466,63 +476,59 @@ def register(ctx):
     else:
         logger.info("LCM slash command registration unavailable on this Hermes host; continuing without /lcm")
 
-    # Register a post_llm_call hook so every completed turn is persisted to
-    # the durable store, regardless of whether compression triggers.  Without
-    # this, short WebUI conversations (which never expire and may never hit
-    # the compression threshold) are invisible to LCM forever.
-    #
-    # The hook fires once per turn after the tool-calling loop completes and
-    # receives conversation_history including the assistant response.  The
-    # existing _ingest_messages cursor prevents duplicates if compress() runs
-    # later the same turn.
-    try:
-        from hermes_cli.plugins import get_plugin_manager as _get_pm
-        _mgr = _get_pm()
+    # Modern hosts observe completed turns through ContextEngine itself. Keep
+    # the legacy post_llm_call scan only for hosts predating that generic seam.
+    if _host_context_engine_supports_turn_observation():
+        logger.debug("LCM uses ContextEngine.on_turn_complete for per-turn observation")
+    else:
+        try:
+            from hermes_cli.plugins import get_plugin_manager as _get_pm
+            _mgr = _get_pm()
 
-        def _on_post_llm_call(**kwargs):
-            history = kwargs.get("conversation_history")
-            if not history:
-                return
-            active_engine = kwargs.get("context_compressor")
-            if not (
-                active_engine is not None
-                and getattr(active_engine, "name", None) == "lcm"
-                and hasattr(active_engine, "ingest")
-            ):
-                active_engine = None
+            def _on_post_llm_call(**kwargs):
+                history = kwargs.get("conversation_history")
+                if not history:
+                    return
+                active_engine = kwargs.get("context_compressor")
+                if not (
+                    active_engine is not None
+                    and getattr(active_engine, "name", None) == "lcm"
+                    and hasattr(active_engine, "ingest")
+                ):
+                    active_engine = None
 
-            session_id = str(kwargs.get("session_id") or "")
-            conversation_id = str(
-                kwargs.get("conversation_id")
-                or kwargs.get("gateway_session_key")
-                or ""
-            )
-            platform = str(kwargs.get("platform") or "")
-
-            if active_engine is None:
-                active_engine = resolve_active_lcm_engine(
-                    session_id=session_id,
-                    conversation_id=conversation_id,
-                ) or engine
-
-            try:
-                # Session identity is authoritative for rebinding. Older hosts
-                # can deliver stale lane metadata alongside the correct active
-                # session id; rebinding a clone on conversation_id mismatch
-                # alone would move it away from the runtime it is serving.
-                _ensure_engine_bound_to_session(
-                    active_engine,
-                    session_id,
-                    platform=platform,
-                    conversation_id=conversation_id,
+                session_id = str(kwargs.get("session_id") or "")
+                conversation_id = str(
+                    kwargs.get("conversation_id")
+                    or kwargs.get("gateway_session_key")
+                    or ""
                 )
-                active_engine.ingest(history)
-            except Exception as exc:
-                logger.debug("LCM post_llm_call ingest error: %s", exc)
+                platform = str(kwargs.get("platform") or "")
 
-        _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
-        logger.debug("LCM registered post_llm_call hook for per-turn ingest")
-    except Exception as exc:
-        logger.debug("LCM could not register post_llm_call hook: %s", exc)
+                if active_engine is None:
+                    active_engine = resolve_active_lcm_engine(
+                        session_id=session_id,
+                        conversation_id=conversation_id,
+                    ) or engine
+
+                try:
+                    # Session identity is authoritative for rebinding. Older
+                    # hosts can deliver stale lane metadata alongside the
+                    # correct active session id; conversation mismatch alone
+                    # must not move a clone away from its serving runtime.
+                    _ensure_engine_bound_to_session(
+                        active_engine,
+                        session_id,
+                        platform=platform,
+                        conversation_id=conversation_id,
+                    )
+                    active_engine.ingest(history)
+                except Exception as exc:
+                    logger.debug("LCM post_llm_call ingest error: %s", exc)
+
+            _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
+            logger.debug("LCM registered legacy post_llm_call hook for per-turn ingest")
+        except Exception as exc:
+            logger.debug("LCM could not register legacy post_llm_call hook: %s", exc)
 
     logger.info("LCM plugin loaded — lossless context management active")

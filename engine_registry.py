@@ -63,11 +63,12 @@ def _remove_registry_entries_for_engine(
 def resolve_active_lcm_engine(session_id: str = "", conversation_id: str = "") -> Any:
     """Return the LCM runtime clone most recently bound to a session/lane.
 
-    Newer Hermes Agent hosts pass the active per-agent context engine directly
-    to ``post_llm_call`` hooks. Older hosts may only pass session/lane ids. LCM
-    clones register their own session binding when ``on_session_start`` runs so
-    post-turn ingest can still follow the active clone instead of rebinding the
-    process-wide plugin singleton.
+    Legacy-hook hosts may pass the active per-agent context engine directly to
+    ``post_llm_call`` or may provide only session/lane ids. LCM clones register
+    their own session binding when ``on_session_start`` runs so compatibility
+    ingest can still follow the active clone instead of rebinding the
+    process-wide plugin singleton. Modern hosts use ``on_turn_complete`` and do
+    not register that duplicate scan.
     """
     session_id = str(session_id or "")
     conversation_id = str(conversation_id or "")

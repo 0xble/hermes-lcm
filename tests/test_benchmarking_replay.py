@@ -92,7 +92,9 @@ def test_replay_defaults_partial_summary_profile_failure_mode_to_none(tmp_path):
     assert metrics.summary_failure_mode is SummaryFailureMode.NONE
 
 
-def test_replay_above_threshold_compresses_and_reports_canary_recall(tmp_path):
+def test_replay_above_threshold_uses_host_pressure_before_preflight(
+    tmp_path, monkeypatch
+):
     fixture = make_synthetic_fixture(
         name="pressure",
         message_pairs=8,
@@ -100,9 +102,30 @@ def test_replay_above_threshold_compresses_and_reports_canary_recall(tmp_path):
         filler_words=80,
     )
     policy = _small_policy()
+    host_pressure_calls = []
+    preflight_calls = []
+    original_should_compress = lcm_engine.LCMEngine.should_compress
+
+    def track_host_pressure(engine, prompt_tokens=None):
+        host_pressure_calls.append(prompt_tokens)
+        return original_should_compress(engine, prompt_tokens)
+
+    def reject_preflight_authority(engine, messages):
+        preflight_calls.append(messages)
+        pytest.fail("preflight must not decide a host-pressure compaction")
+
+    monkeypatch.setattr(lcm_engine.LCMEngine, "should_compress", track_host_pressure)
+    monkeypatch.setattr(
+        lcm_engine.LCMEngine,
+        "should_compress_preflight",
+        reject_preflight_authority,
+    )
 
     metrics = run_replay(fixture, policy, output_dir=tmp_path)
 
+    assert metrics.prompt_tokens_before >= metrics.threshold_tokens
+    assert host_pressure_calls == [metrics.prompt_tokens_before]
+    assert preflight_calls == []
     assert metrics.compaction_attempts == 1
     assert metrics.compression_count >= 1
     assert metrics.prompt_tokens_before > metrics.prompt_tokens_after

@@ -214,7 +214,9 @@ def run_replay(
     compaction_attempts = 0
     before = count_messages_tokens(messages)
     try:
-        should_compress = engine.should_compress_preflight(messages)
+        should_compress = engine.should_compress(before)
+        if not should_compress:
+            should_compress = engine.should_compress_preflight(messages)
         if should_compress:
             compaction_attempts = 1
             with patched_deterministic_summarizer(max_canaries=max_summary_canaries):

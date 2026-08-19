@@ -69,6 +69,20 @@ def _ensure_agent_context_engine_importable(monkeypatch):
     )
 
 
+def _set_host_turn_observation_support(monkeypatch, *, enabled: bool) -> None:
+    from agent.context_engine import ContextEngine
+
+    if enabled:
+        monkeypatch.setattr(
+            ContextEngine,
+            "on_turn_complete",
+            lambda self, messages, usage=None, **kwargs: None,
+            raising=False,
+        )
+    else:
+        monkeypatch.delattr(ContextEngine, "on_turn_complete", raising=False)
+
+
 def _register_plugin_engine(module_name: str):
     module = _load_plugin_entrypoint_module(module_name)
 
@@ -1250,7 +1264,33 @@ def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(mo
         assert kwargs["messages"] == test_messages, f"{name}: messages content mismatch"
 
 
+def test_modern_host_uses_context_engine_observation_without_post_llm_hook(monkeypatch, tmp_path):
+    _set_host_turn_observation_support(monkeypatch, enabled=True)
+    module = _load_plugin_entrypoint_module("hermes_lcm_modern_turn_observation")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert "post_llm_call" not in manager._hooks
+    ctx.engine.shutdown()
+
+
 def test_post_llm_hook_resolves_registered_active_clone_without_host_context_compressor(monkeypatch, tmp_path):
+    _set_host_turn_observation_support(monkeypatch, enabled=False)
     module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_registered_clone")
     manager = types.SimpleNamespace(_hooks={})
     fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
@@ -1308,6 +1348,7 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
 
 
 def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, tmp_path):
+    _set_host_turn_observation_support(monkeypatch, enabled=False)
     for lookup_mode in ("session", "conversation", "mismatched_conversation"):
         module = _load_plugin_entrypoint_module(f"hermes_lcm_post_hook_stale_{lookup_mode}")
         manager = types.SimpleNamespace(_hooks={})
@@ -1378,6 +1419,7 @@ def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, 
 
 
 def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
+    _set_host_turn_observation_support(monkeypatch, enabled=False)
     module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_active_clone")
     manager = types.SimpleNamespace(_hooks={})
     fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
@@ -1441,6 +1483,7 @@ def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
 
 
 def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatch, tmp_path):
+    _set_host_turn_observation_support(monkeypatch, enabled=False)
     module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_singleton_rebind")
     manager = types.SimpleNamespace(_hooks={})
     fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
